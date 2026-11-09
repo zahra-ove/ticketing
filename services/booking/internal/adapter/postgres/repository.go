@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -55,7 +56,7 @@ func (r *Repository) Create(ctx context.Context, b *domain.Booking) error {
 		if err := tx.SendBatch(ctx, batch).Close(); err != nil {
 			return fmt.Errorf("insert booking seats: %w", err)
 		}
-		return nil
+		return saveEvents(ctx, tx, b.PullEvents())
 	})
 
 	var pgErr *pgconn.PgError
@@ -76,7 +77,7 @@ func (r *Repository) Create(ctx context.Context, b *domain.Booking) error {
 }
 
 const selectBooking = `
-SELECT id, hold_id, event_id, customer_id, status, total_cents, created_at, updated_at
+SELECT id, hold_id, event_id, customer_id, status, cancel_reason, total_cents, created_at, updated_at
 FROM bookings`
 
 // Get implements app.Repository.
@@ -101,14 +102,17 @@ func (r *Repository) Update(ctx context.Context, id uuid.UUID, fn func(*domain.B
 			return err
 		}
 
-		if _, err := tx.Exec(ctx, `UPDATE bookings SET status = $2, updated_at = $3 WHERE id = $1`,
-			b.ID, string(b.Status), b.UpdatedAt); err != nil {
+		if _, err := tx.Exec(ctx, `UPDATE bookings SET status = $2, cancel_reason = $3, updated_at = $4 WHERE id = $1`,
+			b.ID, string(b.Status), nullableReason(b.CancelReason), b.UpdatedAt); err != nil {
 			return fmt.Errorf("update booking: %w", err)
 		}
 		// Cancelled bookings drop out of the unique index, freeing their seats.
 		if _, err := tx.Exec(ctx, `UPDATE booking_seats SET active = $2 WHERE booking_id = $1`,
 			b.ID, b.Active()); err != nil {
 			return fmt.Errorf("update booking seats: %w", err)
+		}
+		if err := saveEvents(ctx, tx, b.PullEvents()); err != nil {
+			return err
 		}
 		updated = b
 		return nil
@@ -140,6 +144,23 @@ func (r *Repository) BookedSeats(ctx context.Context, eventID uuid.UUID, ids []u
 	return seats, nil
 }
 
+// PendingCreatedBefore implements app.Repository.
+func (r *Repository) PendingCreatedBefore(ctx context.Context, cutoff time.Time, limit int) ([]uuid.UUID, error) {
+	rows, err := r.pool.Query(ctx, `
+		SELECT id FROM bookings
+		WHERE status = 'pending_payment' AND created_at < $1
+		ORDER BY created_at
+		LIMIT $2`, cutoff, limit)
+	if err != nil {
+		return nil, fmt.Errorf("query pending bookings: %w", err)
+	}
+	ids, err := pgx.CollectRows(rows, pgx.RowTo[uuid.UUID])
+	if err != nil {
+		return nil, fmt.Errorf("scan pending bookings: %w", err)
+	}
+	return ids, nil
+}
+
 // querier is satisfied by both *pgxpool.Pool and pgx.Tx.
 type querier interface {
 	Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
@@ -154,9 +175,13 @@ func (r *Repository) getOne(ctx context.Context, q querier, sql string, arg any)
 		var (
 			b      domain.Booking
 			status string
+			reason *string
 		)
-		err := row.Scan(&b.ID, &b.HoldID, &b.EventID, &b.CustomerID, &status, &b.TotalCents, &b.CreatedAt, &b.UpdatedAt)
+		err := row.Scan(&b.ID, &b.HoldID, &b.EventID, &b.CustomerID, &status, &reason, &b.TotalCents, &b.CreatedAt, &b.UpdatedAt)
 		b.Status = domain.Status(status)
+		if reason != nil {
+			b.CancelReason = domain.CancelReason(*reason)
+		}
 		b.CreatedAt, b.UpdatedAt = b.CreatedAt.UTC(), b.UpdatedAt.UTC()
 		return b, err
 	})

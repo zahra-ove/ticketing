@@ -22,6 +22,12 @@ type Config struct {
 	// EventGRPCAddr is the address of the event service's internal gRPC API.
 	EventGRPCAddr string `env:"EVENT_GRPC_ADDR" envDefault:"localhost:9000"`
 
+	KafkaBrokers string `env:"KAFKA_BROKERS" envDefault:"localhost:19092"`
+	// PaymentTimeout is how long a booking may wait for its payment before it
+	// is cancelled; SweepInterval is how often that is checked.
+	PaymentTimeout time.Duration `env:"PAYMENT_TIMEOUT" envDefault:"15m"`
+	SweepInterval  time.Duration `env:"SWEEP_INTERVAL"  envDefault:"30s"`
+
 	DB    DB    `envPrefix:"DB_"`
 	Redis Redis `envPrefix:"REDIS_"`
 }

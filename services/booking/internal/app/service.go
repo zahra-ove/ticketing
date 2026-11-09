@@ -203,7 +203,7 @@ func (s *Service) CancelBooking(ctx context.Context, customerID, id uuid.UUID) (
 		if b.CustomerID != customerID {
 			return domain.ErrBookingNotFound
 		}
-		return b.Cancel(s.now())
+		return b.Cancel(s.now(), domain.CancelByCustomer)
 	})
 	if err != nil {
 		return nil, fmt.Errorf("cancel booking %s: %w", id, err)
@@ -228,6 +228,84 @@ func (s *Service) GetAvailability(ctx context.Context, eventID uuid.UUID) (Avail
 		return Availability{}, fmt.Errorf("list held seats: %w", err)
 	}
 	return Availability{Booked: booked, Held: held}, nil
+}
+
+// errNoChange makes an Update a no-op: the callback returns it when the
+// booking is already in the wanted state (a duplicate message), so nothing is
+// written and no event is published twice.
+var errNoChange = errors.New("no change")
+
+func (s *Service) update(ctx context.Context, id uuid.UUID, fn func(b *domain.Booking) error) error {
+	_, err := s.repo.Update(ctx, id, fn)
+	if errors.Is(err, errNoChange) {
+		return nil
+	}
+	return err
+}
+
+// HandlePaymentSucceeded is the saga step after a successful payment: the
+// booking is confirmed. If it was cancelled in the meantime (by the customer
+// or by the payment timeout), the payment is compensated with a refund.
+// Safe to call more than once for the same payment.
+func (s *Service) HandlePaymentSucceeded(ctx context.Context, bookingID, paymentID uuid.UUID) error {
+	err := s.update(ctx, bookingID, func(b *domain.Booking) error {
+		switch b.Status {
+		case domain.StatusPendingPayment:
+			return b.Confirm(s.now())
+		case domain.StatusCancelled:
+			return b.RequestRefund(paymentID, s.now())
+		default: // already confirmed: duplicate delivery
+			return errNoChange
+		}
+	})
+	if err != nil {
+		return fmt.Errorf("handle payment succeeded for booking %s: %w", bookingID, err)
+	}
+	return nil
+}
+
+// HandlePaymentFailed is the saga's compensating step: the booking is
+// cancelled and its seats are released. Safe to call more than once.
+func (s *Service) HandlePaymentFailed(ctx context.Context, bookingID uuid.UUID) error {
+	err := s.update(ctx, bookingID, func(b *domain.Booking) error {
+		if b.Status != domain.StatusPendingPayment {
+			return errNoChange
+		}
+		return b.Cancel(s.now(), domain.CancelPaymentFailed)
+	})
+	if err != nil {
+		return fmt.Errorf("handle payment failed for booking %s: %w", bookingID, err)
+	}
+	return nil
+}
+
+// ExpireUnpaidBookings cancels bookings that waited longer than timeout for
+// their payment, so seats are not blocked forever when the payment service is
+// down or never answers. It returns how many bookings were cancelled.
+func (s *Service) ExpireUnpaidBookings(ctx context.Context, timeout time.Duration, limit int) (int, error) {
+	ids, err := s.repo.PendingCreatedBefore(ctx, s.now().Add(-timeout), limit)
+	if err != nil {
+		return 0, fmt.Errorf("list unpaid bookings: %w", err)
+	}
+	expired := 0
+	for _, id := range ids {
+		cancelled := false
+		err := s.update(ctx, id, func(b *domain.Booking) error {
+			// Re-checked under the row lock: a payment may have arrived since the listing.
+			if b.Status != domain.StatusPendingPayment {
+				return errNoChange
+			}
+			cancelled = true
+			return b.Cancel(s.now(), domain.CancelPaymentTimeout)
+		})
+		if err != nil {
+			return expired, fmt.Errorf("expire booking %s: %w", id, err)
+		}
+		if cancelled {
+			expired++
+		}
+	}
+	return expired, nil
 }
 
 func joinIDs(ids []uuid.UUID) string {

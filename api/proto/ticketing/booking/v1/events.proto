@@ -1,0 +1,54 @@
+syntax = "proto3";
+
+package ticketing.booking.v1;
+
+import "google/protobuf/timestamp.proto";
+
+// Events published by the booking service on the topic
+// "ticketing.booking.events.v1", keyed by booking id so that all events of a
+// booking keep their order. Payloads are encoded with protojson; the message
+// type travels in the CloudEvents "ce_type" header.
+
+// BookingCreated starts the payment saga.
+message BookingCreated {
+  string booking_id = 1;
+  string event_id = 2;
+  string customer_id = 3;
+  int64 amount_cents = 4;
+  repeated string seat_ids = 5;
+  google.protobuf.Timestamp created_at = 6;
+}
+
+// BookingConfirmed is published once the payment succeeded.
+message BookingConfirmed {
+  string booking_id = 1;
+  string event_id = 2;
+  string customer_id = 3;
+  int64 amount_cents = 4;
+  google.protobuf.Timestamp confirmed_at = 5;
+}
+
+enum CancelReason {
+  CANCEL_REASON_UNSPECIFIED = 0;
+  CANCEL_REASON_CUSTOMER = 1;
+  CANCEL_REASON_PAYMENT_FAILED = 2;
+  CANCEL_REASON_PAYMENT_TIMEOUT = 3;
+}
+
+// BookingCancelled is published when a booking is cancelled; its seats are free again.
+message BookingCancelled {
+  string booking_id = 1;
+  string event_id = 2;
+  string customer_id = 3;
+  CancelReason reason = 4;
+  google.protobuf.Timestamp cancelled_at = 5;
+}
+
+// RefundRequested is the saga's compensation: a payment succeeded for a
+// booking that had already been cancelled (by the customer or by timeout).
+message RefundRequested {
+  string booking_id = 1;
+  string customer_id = 2;
+  string payment_id = 3;
+  google.protobuf.Timestamp requested_at = 4;
+}

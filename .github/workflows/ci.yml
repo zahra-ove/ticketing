@@ -80,6 +80,6 @@ jobs:
         run: for f in deploy/compose/observability/grafana/dashboards/*.json; do jq empty "$f"; done
       - name: Build service images
         run: |
-          for svc in event booking; do
+          for svc in event booking payment; do
             docker build --build-arg SERVICE=$svc -t ticketing/$svc:ci .
           done

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/google/uuid"
 	"go.opentelemetry.io/otel"
@@ -156,4 +157,32 @@ func (s *InstrumentedService) GetAvailability(ctx context.Context, eventID uuid.
 	av, err = s.next.GetAvailability(ctx, eventID)
 	span.SetAttributes(attribute.Int("ticketing.seats.booked", len(av.Booked)), attribute.Int("ticketing.seats.held", len(av.Held)))
 	return av, err
+}
+
+// HandlePaymentSucceeded implements the saga step with tracing.
+func (s *InstrumentedService) HandlePaymentSucceeded(ctx context.Context, bookingID, paymentID uuid.UUID) (err error) {
+	ctx, span := s.tracer.Start(ctx, "BookingService.HandlePaymentSucceeded", trace.WithAttributes(
+		bookingIDKey.String(bookingID.String()), attribute.String("ticketing.payment.id", paymentID.String())))
+	defer func() { telemetry.End(span, err, isExpected) }()
+	return s.next.HandlePaymentSucceeded(ctx, bookingID, paymentID)
+}
+
+// HandlePaymentFailed implements the saga step with tracing.
+func (s *InstrumentedService) HandlePaymentFailed(ctx context.Context, bookingID uuid.UUID) (err error) {
+	ctx, span := s.tracer.Start(ctx, "BookingService.HandlePaymentFailed", trace.WithAttributes(bookingIDKey.String(bookingID.String())))
+	defer func() { telemetry.End(span, err, isExpected) }()
+	return s.next.HandlePaymentFailed(ctx, bookingID)
+}
+
+// ExpireUnpaidBookings implements the sweeper with tracing and metrics.
+func (s *InstrumentedService) ExpireUnpaidBookings(ctx context.Context, timeout time.Duration, limit int) (n int, err error) {
+	ctx, span := s.tracer.Start(ctx, "BookingService.ExpireUnpaidBookings")
+	defer func() { telemetry.End(span, err, isExpected) }()
+
+	n, err = s.next.ExpireUnpaidBookings(ctx, timeout, limit)
+	span.SetAttributes(attribute.Int("ticketing.bookings.expired", n))
+	if n > 0 {
+		s.cancelled.Add(ctx, int64(n))
+	}
+	return n, err
 }

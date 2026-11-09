@@ -152,7 +152,7 @@ services-down: ## Stop infrastructure and all services
 
 .PHONY: services-logs
 services-logs: ## Follow logs of all services
-	$(STACK) logs -f event booking
+	$(STACK) logs -f event booking payment
 
 .PHONY: compose-config
 compose-config: $(COMPOSE_DIR)/.env ## Validate the compose files

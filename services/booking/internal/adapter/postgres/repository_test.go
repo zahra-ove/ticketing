@@ -125,7 +125,7 @@ func TestRepository_CancelFreesSeats(t *testing.T) {
 		t.Fatalf("second booking of the same seat: error = %v, want SeatsUnavailableError", err)
 	}
 
-	if _, err := repo.Update(t.Context(), first.ID, func(b *domain.Booking) error { return b.Cancel(time.Now()) }); err != nil {
+	if _, err := repo.Update(t.Context(), first.ID, func(b *domain.Booking) error { return b.Cancel(time.Now(), domain.CancelByCustomer) }); err != nil {
 		t.Fatal(err)
 	}
 	if booked, _ := repo.BookedSeats(t.Context(), eventID, nil); len(booked) != 0 {
@@ -168,5 +168,62 @@ func TestRepository_ConcurrentBookingsOfSameSeat(t *testing.T) {
 
 	if successes != 1 {
 		t.Fatalf("got %d bookings for one seat, want exactly 1", successes)
+	}
+}
+
+// Every state change writes its event to the outbox in the same transaction.
+func TestRepository_WritesEventsToOutbox(t *testing.T) {
+	repo := postgres.NewRepository(pool)
+	b := newBooking(t, uuid.New(), uuid.New())
+	if err := repo.Create(t.Context(), b); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repo.Update(t.Context(), b.ID, func(b *domain.Booking) error {
+		return b.Cancel(time.Now(), domain.CancelByCustomer)
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	rows, err := pool.Query(t.Context(), `SELECT type FROM outbox WHERE key = $1 ORDER BY created_at, id`, b.ID.String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var types []string
+	for rows.Next() {
+		var typ string
+		if err := rows.Scan(&typ); err != nil {
+			t.Fatal(err)
+		}
+		types = append(types, typ)
+	}
+	want := []string{"ticketing.booking.v1.BookingCreated", "ticketing.booking.v1.BookingCancelled"}
+	if fmt.Sprint(types) != fmt.Sprint(want) {
+		t.Errorf("outbox types = %v, want %v", types, want)
+	}
+
+	got, err := repo.Get(t.Context(), b.ID)
+	if err != nil || got.CancelReason != domain.CancelByCustomer {
+		t.Errorf("cancel reason = %q (%v), want customer", got.CancelReason, err)
+	}
+}
+
+// A failed transaction must not leave its event behind.
+func TestRepository_RolledBackChangeHasNoEvent(t *testing.T) {
+	repo := postgres.NewRepository(pool)
+	eventID, seat := uuid.New(), uuid.New()
+	if err := repo.Create(t.Context(), newBooking(t, eventID, seat)); err != nil {
+		t.Fatal(err)
+	}
+	loser := newBooking(t, eventID, seat) // same seat: the insert fails
+	if err := repo.Create(t.Context(), loser); err == nil {
+		t.Fatal("expected the second booking of the seat to fail")
+	}
+
+	var n int
+	if err := pool.QueryRow(t.Context(), `SELECT count(*) FROM outbox WHERE key = $1`, loser.ID.String()).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 0 {
+		t.Errorf("found %d outbox rows for a booking that was never stored", n)
 	}
 }

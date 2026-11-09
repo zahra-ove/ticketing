@@ -45,26 +45,28 @@ func toHoldResponse(h *domain.Hold) holdResponse {
 }
 
 type bookingResponse struct {
-	ID         uuid.UUID `json:"id"`
-	HoldID     uuid.UUID `json:"hold_id"`
-	EventID    uuid.UUID `json:"event_id"`
-	Status     string    `json:"status"`
-	Seats      []seatDTO `json:"seats"`
-	TotalCents int64     `json:"total_cents"`
-	CreatedAt  time.Time `json:"created_at"`
-	UpdatedAt  time.Time `json:"updated_at"`
+	ID           uuid.UUID `json:"id"`
+	HoldID       uuid.UUID `json:"hold_id"`
+	EventID      uuid.UUID `json:"event_id"`
+	Status       string    `json:"status"`
+	CancelReason string    `json:"cancel_reason,omitempty"`
+	Seats        []seatDTO `json:"seats"`
+	TotalCents   int64     `json:"total_cents"`
+	CreatedAt    time.Time `json:"created_at"`
+	UpdatedAt    time.Time `json:"updated_at"`
 }
 
 func toBookingResponse(b *domain.Booking) bookingResponse {
 	return bookingResponse{
-		ID:         b.ID,
-		HoldID:     b.HoldID,
-		EventID:    b.EventID,
-		Status:     string(b.Status),
-		Seats:      toSeatDTOs(b.Seats),
-		TotalCents: b.TotalCents,
-		CreatedAt:  b.CreatedAt,
-		UpdatedAt:  b.UpdatedAt,
+		ID:           b.ID,
+		HoldID:       b.HoldID,
+		EventID:      b.EventID,
+		Status:       string(b.Status),
+		CancelReason: string(b.CancelReason),
+		Seats:        toSeatDTOs(b.Seats),
+		TotalCents:   b.TotalCents,
+		CreatedAt:    b.CreatedAt,
+		UpdatedAt:    b.UpdatedAt,
 	}
 }
 

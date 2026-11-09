@@ -5,7 +5,7 @@ portfolio project that focuses on the hard parts of distributed systems:
 concurrent seat reservations, distributed transactions (saga), reliable
 messaging (transactional outbox), idempotency and end-to-end observability.
 
-> Status: work in progress. Phases 1–4 are done: infrastructure, observability, the `event` service and the `booking` service with concurrency-safe seat holds.
+> Status: work in progress. Phases 1–5 are done: infrastructure, observability, the `event`, `booking` and `payment` services, and the payment saga over Kafka.
 
 ## Architecture
 
@@ -13,7 +13,7 @@ messaging (transactional outbox), idempotency and end-to-end observability.
 |---|---|---|---|
 | `event` | Events, venues and seat catalog | Postgres | HTTP (public), gRPC (internal) |
 | `booking` | Seat holds with TTL, bookings, saga orchestration | Postgres, Redis | HTTP, gRPC client, Kafka |
-| `payment` | Mock payment provider with idempotency keys | Postgres | Kafka |
+| `payment` | Charges and refunds through a mock provider with idempotency keys | Postgres | Kafka, HTTP (read-only) |
 | `notification` | Sends booking emails | — | Kafka |
 
 Infrastructure: Postgres (database per service), Redis, Redpanda (Kafka API),
@@ -24,7 +24,10 @@ Loki and Grafana.
 client ──HTTP──▶ booking ──gRPC──▶ event ──▶ Postgres (event)
                     │
                     ├──▶ Redis     seat holds (atomic Lua, TTL)
-                    └──▶ Postgres  bookings (unique index: one active booking per seat)
+                    ├──▶ Postgres  bookings + outbox
+                    │
+                    └── Kafka (Redpanda) ◀──▶ payment ──▶ Postgres (payments + outbox)
+                        booking events / payment events  (choreographed saga)
 ```
 
 Architecture decisions are recorded in [docs/adr](docs/adr).
@@ -43,7 +46,7 @@ make check      # lint, tests with -race, govulncheck
 |---|---|
 | Grafana (dashboards, traces, logs) | http://localhost:3000 |
 | Prometheus | http://localhost:9090 |
-| Redpanda Console | http://localhost:8085 |
+| Redpanda Console (topics, messages) | http://localhost:8085 |
 | Postgres | `localhost:5432` |
 | Redis | `localhost:6379` |
 | Kafka (from host) | `localhost:19092` |
@@ -143,6 +146,24 @@ curl -i localhost:8082/v1/bookings -H 'X-Customer-ID: 11111111-1111-4111-8111-11
 How double booking is prevented is explained in
 [ADR 5](docs/adr/0005-seat-holds-in-redis-bookings-in-postgres.md).
 
+## Payment saga
+
+A new booking is `pending_payment`. The booking service publishes
+`BookingCreated` (through its outbox); the payment service charges the
+customer and publishes `PaymentSucceeded` or `PaymentFailed`; the booking is
+then `confirmed` or `cancelled` (seats freed). Bookings unpaid after
+`PAYMENT_TIMEOUT` are cancelled, and a payment that arrives for a cancelled
+booking is refunded.
+
+```bash
+curl localhost:8083/v1/payments?booking_id=<booking id>   # payment status
+```
+
+To try the failure paths: prices ending in `.13` (e.g. `2513` cents) are
+declined by the mock provider; `PROVIDER_FAILURE_RATE` injects transient
+errors (retried); stop the payment container to see the timeout and the
+refund compensation. Details in [ADR 6](docs/adr/0006-payment-saga-with-outbox-and-kafka.md).
+
 ## Repository layout
 
 ```
@@ -159,7 +180,7 @@ docs/adr/               architecture decision records
 - [x] Phase 2 — `event` service end to end
 - [x] Phase 3 — observability stack (OpenTelemetry, Prometheus, Tempo, Loki, Grafana)
 - [x] Phase 4 — `booking` service, gRPC, seat holds in Redis
-- [ ] Phase 5 — Kafka, transactional outbox, `payment` service, saga
+- [x] Phase 5 — Kafka, transactional outbox, `payment` service, saga
 - [ ] Phase 6 — `notification` service
 - [ ] Phase 7 — Traefik gateway and JWT authentication
 - [ ] Phase 8 — dashboards, load tests, hardening

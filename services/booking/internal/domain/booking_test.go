@@ -84,13 +84,13 @@ func TestBooking_Transitions(t *testing.T) {
 	t.Run("cancel pending", func(t *testing.T) {
 		t.Parallel()
 		b := newPending(t)
-		if err := b.Cancel(now); err != nil {
+		if err := b.Cancel(now, domain.CancelByCustomer); err != nil {
 			t.Fatal(err)
 		}
 		if b.Active() {
 			t.Error("cancelled booking must release its seats")
 		}
-		if err := b.Cancel(now); !errors.Is(err, domain.ErrInvalidTransition) {
+		if err := b.Cancel(now, domain.CancelByCustomer); !errors.Is(err, domain.ErrInvalidTransition) {
 			t.Errorf("second cancel error = %v", err)
 		}
 	})
@@ -101,8 +101,55 @@ func TestBooking_Transitions(t *testing.T) {
 		if err := b.Confirm(now); err != nil {
 			t.Fatal(err)
 		}
-		if err := b.Cancel(now); !errors.Is(err, domain.ErrInvalidTransition) {
+		if err := b.Cancel(now, domain.CancelByCustomer); !errors.Is(err, domain.ErrInvalidTransition) {
 			t.Errorf("cancel confirmed error = %v", err)
 		}
 	})
+}
+
+func TestBooking_RecordsEvents(t *testing.T) {
+	t.Parallel()
+
+	b, err := domain.NewBooking(&domain.Hold{ID: uuid.New(), Seats: []domain.Seat{{ID: uuid.New(), PriceCents: 700}}}, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	created := b.PullEvents()
+	if len(created) != 1 {
+		t.Fatalf("got %d events after NewBooking, want 1", len(created))
+	}
+	if ev, ok := created[0].(domain.BookingCreated); !ok || ev.Booking.TotalCents != 700 {
+		t.Errorf("event = %#v, want BookingCreated with total 700", created[0])
+	}
+	if len(b.PullEvents()) != 0 {
+		t.Error("PullEvents must forget returned events")
+	}
+
+	if err := b.Cancel(now, domain.CancelPaymentTimeout); err != nil {
+		t.Fatal(err)
+	}
+	paymentID := uuid.New()
+	if err := b.RequestRefund(paymentID, now); err != nil {
+		t.Fatal(err)
+	}
+
+	events := b.PullEvents()
+	if len(events) != 2 {
+		t.Fatalf("got %d events, want cancelled + refund", len(events))
+	}
+	if ev, ok := events[0].(domain.BookingCancelled); !ok || ev.Reason != domain.CancelPaymentTimeout {
+		t.Errorf("first event = %#v", events[0])
+	}
+	if ev, ok := events[1].(domain.RefundRequested); !ok || ev.PaymentID != paymentID {
+		t.Errorf("second event = %#v", events[1])
+	}
+}
+
+func TestBooking_RefundOnlyWhenCancelled(t *testing.T) {
+	t.Parallel()
+	b, _ := domain.NewBooking(&domain.Hold{ID: uuid.New()}, now)
+
+	if err := b.RequestRefund(uuid.New(), now); !errors.Is(err, domain.ErrInvalidTransition) {
+		t.Errorf("refund of a pending booking: error = %v, want ErrInvalidTransition", err)
+	}
 }

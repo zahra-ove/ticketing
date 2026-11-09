@@ -71,4 +71,7 @@ type Repository interface {
 	// BookedSeats returns the seats of the event that are in an active booking.
 	// When seatIDs is not empty, only those seats are checked.
 	BookedSeats(ctx context.Context, eventID uuid.UUID, seatIDs []uuid.UUID) ([]uuid.UUID, error)
+	// PendingCreatedBefore returns up to limit bookings still waiting for
+	// payment that were created before cutoff, oldest first.
+	PendingCreatedBefore(ctx context.Context, cutoff time.Time, limit int) ([]uuid.UUID, error)
 }

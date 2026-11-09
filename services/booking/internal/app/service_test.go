@@ -195,6 +195,18 @@ func (r *fakeRepo) BookedSeats(_ context.Context, eventID uuid.UUID, ids []uuid.
 	return out, nil
 }
 
+func (r *fakeRepo) PendingCreatedBefore(_ context.Context, cutoff time.Time, limit int) ([]uuid.UUID, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	var ids []uuid.UUID
+	for _, b := range r.bookings {
+		if b.Status == domain.StatusPendingPayment && b.CreatedAt.Before(cutoff) && len(ids) < limit {
+			ids = append(ids, b.ID)
+		}
+	}
+	return ids, nil
+}
+
 type fixture struct {
 	svc     *app.Service
 	catalog *fakeCatalog
@@ -413,5 +425,94 @@ func wantUnavailable(t *testing.T, err error) {
 	var uerr *domain.SeatsUnavailableError
 	if !errors.As(err, &uerr) {
 		t.Fatalf("error = %v, want *SeatsUnavailableError", err)
+	}
+}
+
+func newPendingBooking(t *testing.T, f *fixture, customer uuid.UUID) *domain.Booking {
+	t.Helper()
+	h, err := f.svc.HoldSeats(t.Context(), customer, f.catalog.eventID, f.seats[:1])
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, _, err := f.svc.CreateBooking(t.Context(), customer, h.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return b
+}
+
+func TestSaga_PaymentSucceededConfirms(t *testing.T) {
+	t.Parallel()
+	f := newFixture(t)
+	customer := uuid.New()
+	b := newPendingBooking(t, f, customer)
+
+	// Delivered twice: the second delivery must be a no-op.
+	for range 2 {
+		if err := f.svc.HandlePaymentSucceeded(t.Context(), b.ID, uuid.New()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got, _ := f.svc.GetBooking(t.Context(), customer, b.ID)
+	if got.Status != domain.StatusConfirmed {
+		t.Errorf("status = %s, want confirmed", got.Status)
+	}
+}
+
+func TestSaga_PaymentFailedCancelsAndFreesSeats(t *testing.T) {
+	t.Parallel()
+	f := newFixture(t)
+	customer := uuid.New()
+	b := newPendingBooking(t, f, customer)
+
+	if err := f.svc.HandlePaymentFailed(t.Context(), b.ID); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := f.svc.GetBooking(t.Context(), customer, b.ID)
+	if got.Status != domain.StatusCancelled || got.CancelReason != domain.CancelPaymentFailed {
+		t.Errorf("booking = %s/%s, want cancelled/payment_failed", got.Status, got.CancelReason)
+	}
+	if _, err := f.svc.HoldSeats(t.Context(), uuid.New(), f.catalog.eventID, f.seats[:1]); err != nil {
+		t.Errorf("seat should be free after failed payment: %v", err)
+	}
+}
+
+func TestSaga_LatePaymentOnCancelledBookingRequestsRefund(t *testing.T) {
+	t.Parallel()
+	f := newFixture(t)
+	customer := uuid.New()
+	b := newPendingBooking(t, f, customer)
+	if _, err := f.svc.CancelBooking(t.Context(), customer, b.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := f.svc.HandlePaymentSucceeded(t.Context(), b.ID, uuid.New()); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := f.svc.GetBooking(t.Context(), customer, b.ID)
+	if got.Status != domain.StatusCancelled {
+		t.Errorf("a cancelled booking must stay cancelled, got %s", got.Status)
+	}
+}
+
+func TestExpireUnpaidBookings(t *testing.T) {
+	t.Parallel()
+	f := newFixture(t)
+	customer := uuid.New()
+	b := newPendingBooking(t, f, customer)
+
+	// Ten minutes later, with a 15 minute timeout: nothing expires.
+	later := app.NewService(f.catalog, f.holds, f.repo, app.WithClock(func() time.Time { return now.Add(10 * time.Minute) }))
+	if n, err := later.ExpireUnpaidBookings(t.Context(), 15*time.Minute, 100); err != nil || n != 0 {
+		t.Fatalf("expired %d (%v), want 0", n, err)
+	}
+
+	muchLater := app.NewService(f.catalog, f.holds, f.repo, app.WithClock(func() time.Time { return now.Add(20 * time.Minute) }))
+	if n, err := muchLater.ExpireUnpaidBookings(t.Context(), 15*time.Minute, 100); err != nil || n != 1 {
+		t.Fatalf("expired %d (%v), want 1", n, err)
+	}
+	got, _ := f.svc.GetBooking(t.Context(), customer, b.ID)
+	if got.CancelReason != domain.CancelPaymentTimeout {
+		t.Errorf("cancel reason = %q, want payment_timeout", got.CancelReason)
 	}
 }

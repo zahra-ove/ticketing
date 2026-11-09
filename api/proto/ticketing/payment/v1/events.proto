@@ -1,0 +1,36 @@
+syntax = "proto3";
+
+package ticketing.payment.v1;
+
+import "google/protobuf/timestamp.proto";
+
+// Events published by the payment service on the topic
+// "ticketing.payment.events.v1", keyed by booking id.
+
+message PaymentSucceeded {
+  string payment_id = 1;
+  string booking_id = 2;
+  string customer_id = 3;
+  int64 amount_cents = 4;
+  // Reference of the charge at the payment provider.
+  string provider_reference = 5;
+  google.protobuf.Timestamp succeeded_at = 6;
+}
+
+message PaymentFailed {
+  string payment_id = 1;
+  string booking_id = 2;
+  string customer_id = 3;
+  int64 amount_cents = 4;
+  // Machine-readable reason, e.g. "card_declined".
+  string reason = 5;
+  google.protobuf.Timestamp failed_at = 6;
+}
+
+message PaymentRefunded {
+  string payment_id = 1;
+  string booking_id = 2;
+  string customer_id = 3;
+  int64 amount_cents = 4;
+  google.protobuf.Timestamp refunded_at = 5;
+}

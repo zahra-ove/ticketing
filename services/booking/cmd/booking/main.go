@@ -2,7 +2,7 @@
 //
 // Usage:
 //
-//	booking serve        start the HTTP server (default)
+//	booking serve        start the HTTP API, outbox relay, payment-events consumer and timeout sweeper (default)
 //	booking migrate      apply database migrations and exit
 //	booking healthcheck  probe /livez of a running server (for container health checks)
 package main
@@ -16,10 +16,14 @@ import (
 	"syscall"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+	"golang.org/x/sync/errgroup"
 
 	"github.com/zahra-ove/ticketing/pkg/bootstrap"
 	"github.com/zahra-ove/ticketing/pkg/grpcx"
 	"github.com/zahra-ove/ticketing/pkg/httpx"
+	"github.com/zahra-ove/ticketing/pkg/kafkax"
+	"github.com/zahra-ove/ticketing/pkg/messaging"
+	"github.com/zahra-ove/ticketing/pkg/outbox"
 	"github.com/zahra-ove/ticketing/pkg/postgres"
 	"github.com/zahra-ove/ticketing/pkg/redisx"
 	"github.com/zahra-ove/ticketing/services/booking/internal/adapter/catalog"
@@ -27,6 +31,7 @@ import (
 	redisadapter "github.com/zahra-ove/ticketing/services/booking/internal/adapter/redis"
 	"github.com/zahra-ove/ticketing/services/booking/internal/app"
 	"github.com/zahra-ove/ticketing/services/booking/internal/config"
+	"github.com/zahra-ove/ticketing/services/booking/internal/transport/consumer"
 	"github.com/zahra-ove/ticketing/services/booking/internal/transport/httpapi"
 )
 
@@ -125,6 +130,25 @@ func serve(ctx context.Context, cfg config.Config, pool *pgxpool.Pool, log *slog
 		return err
 	}
 
+	producer, err := kafkax.NewProducer(cfg.KafkaBrokers, serviceName+"-outbox")
+	if err != nil {
+		return err
+	}
+	defer producer.Close()
+	relay, err := outbox.NewRelay(pool, producer, outbox.RelayConfig{}, log)
+	if err != nil {
+		return err
+	}
+
+	paymentEvents, err := kafkax.NewConsumer(kafkax.ConsumerConfig{
+		Brokers: cfg.KafkaBrokers,
+		Group:   "booking.payment-events",
+		Topics:  []string{messaging.TopicPaymentEvents},
+	}, consumer.NewHandler(svc), log)
+	if err != nil {
+		return err
+	}
+
 	// Readiness covers only this service's own stores. The event service is
 	// left out on purpose: its outage must not take booking out of rotation.
 	deps := map[string]httpx.Pinger{
@@ -132,5 +156,15 @@ func serve(ctx context.Context, cfg config.Config, pool *pgxpool.Pool, log *slog
 		"redis":    httpx.PingerFunc(func(ctx context.Context) error { return rdb.Ping(ctx).Err() }),
 	}
 	srv := httpx.NewServer(cfg.HTTPAddr, httpapi.NewHandler(svc, deps, log), log)
-	return httpx.Run(ctx, srv, cfg.ShutdownTimeout, log)
+
+	// HTTP API, outbox relay, payment-events consumer and timeout sweeper run
+	// side by side; if one fails, all stop and the process exits.
+	g, gctx := errgroup.WithContext(ctx)
+	g.Go(func() error { return httpx.Run(gctx, srv, cfg.ShutdownTimeout, log) })
+	g.Go(func() error { return relay.Run(gctx) })
+	g.Go(func() error { return paymentEvents.Run(gctx) })
+	g.Go(func() error {
+		return app.RunPaymentTimeoutSweeper(gctx, svc, cfg.SweepInterval, cfg.PaymentTimeout, log)
+	})
+	return g.Wait()
 }
