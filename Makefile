@@ -7,10 +7,17 @@ INFRA        := docker compose $(COMPOSE_ENV) -f $(COMPOSE_DIR)/docker-compose.i
 OBS          := docker compose $(COMPOSE_ENV) -f $(COMPOSE_DIR)/docker-compose.infra.yml -f $(COMPOSE_DIR)/docker-compose.observability.yml
 STACK        := $(OBS) -f $(COMPOSE_DIR)/docker-compose.services.yml
 
-# Local run of the event service against the infra started by `make infra-up`.
-EVENT_ENV := DB_URL=postgres://event:event@localhost:5432/event?sslmode=disable \
-             HTTP_ADDR=:8081 LOG_FORMAT=text LOG_LEVEL=debug \
-             OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317 OTEL_METRIC_EXPORT_INTERVAL=10000
+# Local runs of the services against the infra started by `make obs-up`.
+LOCAL_ENV   := LOG_FORMAT=text LOG_LEVEL=debug \
+               OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317 OTEL_METRIC_EXPORT_INTERVAL=10000
+EVENT_ENV   := $(LOCAL_ENV) DB_URL=postgres://event:event@localhost:5432/event?sslmode=disable \
+               HTTP_ADDR=:8081 GRPC_ADDR=:9000
+BOOKING_ENV := $(LOCAL_ENV) DB_URL=postgres://booking:booking@localhost:5432/booking?sslmode=disable \
+               HTTP_ADDR=:8082 EVENT_GRPC_ADDR=localhost:9000 REDIS_ADDR=localhost:6379 REDIS_PASSWORD=redis
+
+BUF_VERSION                := v1.57.2
+PROTOC_GEN_GO_VERSION      := v1.36.9
+PROTOC_GEN_GO_GRPC_VERSION := v1.5.1
 
 # The race detector needs cgo (a C compiler). Enable it only when gcc exists,
 # so `make test` also works on Windows machines without a toolchain. CI always has it.
@@ -73,8 +80,20 @@ build: ## Build all packages
 check: lint test vuln ## Run everything CI runs
 
 .PHONY: tools
-tools: ## Install development tools
+tools: ## Install development tools (linters, buf, protoc plugins)
 	go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@$(GOLANGCI_LINT_VERSION)
+	go install github.com/bufbuild/buf/cmd/buf@$(BUF_VERSION)
+	go install google.golang.org/protobuf/cmd/protoc-gen-go@$(PROTOC_GEN_GO_VERSION)
+	go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@$(PROTOC_GEN_GO_GRPC_VERSION)
+
+.PHONY: proto
+proto: ## Lint protobuf files and regenerate Go code into api/gen
+	buf lint
+	buf generate
+
+.PHONY: proto-breaking
+proto-breaking: ## Fail if protobuf changes break compatibility with main
+	buf breaking --against '.git#branch=main'
 
 ##@ Infrastructure
 
@@ -118,6 +137,11 @@ run-event: ## Migrate and run the event service locally (needs infra-up)
 	$(EVENT_ENV) go run ./services/event/cmd/event migrate
 	$(EVENT_ENV) go run ./services/event/cmd/event serve
 
+.PHONY: run-booking
+run-booking: ## Migrate and run the booking service locally (needs obs-up and run-event)
+	$(BOOKING_ENV) go run ./services/booking/cmd/booking migrate
+	$(BOOKING_ENV) go run ./services/booking/cmd/booking serve
+
 .PHONY: services-up
 services-up: $(COMPOSE_DIR)/.env ## Build and start infrastructure and all services in Docker
 	$(STACK) up -d --build --wait
@@ -128,7 +152,7 @@ services-down: ## Stop infrastructure and all services
 
 .PHONY: services-logs
 services-logs: ## Follow logs of all services
-	$(STACK) logs -f event
+	$(STACK) logs -f event booking
 
 .PHONY: compose-config
 compose-config: $(COMPOSE_DIR)/.env ## Validate the compose files

@@ -1,0 +1,17 @@
+# Generates Go code into api/gen. Generated code is committed, so building the
+# services needs no protobuf tooling. Regenerate with `make proto`.
+version: v2
+managed:
+  enabled: true
+  override:
+    - file_option: go_package_prefix
+      value: github.com/zahra-ove/ticketing/api/gen
+plugins:
+  - local: protoc-gen-go
+    out: api/gen
+    opt: paths=source_relative
+  - local: protoc-gen-go-grpc
+    out: api/gen
+    opt: paths=source_relative
+inputs:
+  - directory: api/proto

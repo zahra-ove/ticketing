@@ -1,26 +1,58 @@
-package httpapi
+package httpx
 
 import (
 	"context"
 	"log/slog"
 	"net/http"
 	"runtime/debug"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 	"go.opentelemetry.io/otel/attribute"
+	semconv "go.opentelemetry.io/otel/semconv/v1.37.0"
 	"go.opentelemetry.io/otel/trace"
 )
 
 // RequestIDHeader carries the request id between clients and services.
 const RequestIDHeader = "X-Request-ID"
 
-type ctxKey struct{}
+type requestIDKey struct{}
 
 // RequestIDFrom returns the request id stored in ctx, or "".
 func RequestIDFrom(ctx context.Context) string {
-	id, _ := ctx.Value(ctxKey{}).(string)
+	id, _ := ctx.Value(requestIDKey{}).(string)
 	return id
+}
+
+func isProbe(path string) bool { return path == "/livez" || path == "/readyz" }
+
+// Middleware wraps h with the standard chain, outermost first:
+// tracing and metrics, request id, access log, panic recovery.
+func Middleware(h http.Handler, log *slog.Logger) http.Handler {
+	h = recoverer(log)(h)
+	h = accessLog(log)(h)
+	h = requestID(h)
+	return otelhttp.NewHandler(h, "http.server",
+		otelhttp.WithFilter(func(r *http.Request) bool { return !isProbe(r.URL.Path) }),
+	)
+}
+
+// Route registers fn for pattern and names the span and metrics after the
+// route template ("GET /v1/events/{id}"), never the raw path, which would
+// explode metric cardinality with one series per id.
+func Route(mux *http.ServeMux, pattern string, fn http.HandlerFunc) {
+	_, path, _ := strings.Cut(pattern, " ")
+	mux.Handle(pattern, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		span := trace.SpanFromContext(r.Context())
+		span.SetName(pattern)
+		span.SetAttributes(semconv.HTTPRoute(path))
+		if l, ok := otelhttp.LabelerFromContext(r.Context()); ok {
+			l.Add(semconv.HTTPRoute(path))
+		}
+		fn(w, r)
+	}))
 }
 
 // requestID reuses a well-formed incoming request id or creates a new one, and
@@ -34,7 +66,7 @@ func requestID(next http.Handler) http.Handler {
 		w.Header().Set(RequestIDHeader, id)
 		// Lets you find a trace in Tempo from the request id a client reports.
 		trace.SpanFromContext(r.Context()).SetAttributes(attribute.String("http.request.id", id))
-		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), ctxKey{}, id)))
+		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), requestIDKey{}, id)))
 	})
 }
 
@@ -66,7 +98,7 @@ func (s *statusRecorder) Unwrap() http.ResponseWriter { return s.ResponseWriter 
 func accessLog(log *slog.Logger) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if r.URL.Path == "/livez" || r.URL.Path == "/readyz" {
+			if isProbe(r.URL.Path) {
 				next.ServeHTTP(w, r)
 				return
 			}
@@ -109,7 +141,7 @@ func recoverer(log *slog.Logger) func(http.Handler) http.Handler {
 					slog.String("stack", string(debug.Stack())),
 					slog.String("request_id", RequestIDFrom(r.Context())),
 				)
-				writeProblem(w, r, problem{Status: http.StatusInternalServerError})
+				WriteProblem(w, r, Problem{Status: http.StatusInternalServerError})
 			}()
 			next.ServeHTTP(w, r)
 		})

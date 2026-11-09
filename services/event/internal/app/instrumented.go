@@ -121,6 +121,19 @@ func (s *InstrumentedService) transition(
 	return ev, nil
 }
 
+// GetSeats implements the use case with tracing.
+func (s *InstrumentedService) GetSeats(ctx context.Context, eventID uuid.UUID, seatIDs []uuid.UUID) (res SeatLookup, err error) {
+	ctx, span := s.tracer.Start(ctx, "EventService.GetSeats", trace.WithAttributes(
+		eventIDKey.String(eventID.String()),
+		attribute.Int("ticketing.seats.requested", len(seatIDs)),
+	))
+	defer func() { telemetry.End(span, err, isExpected) }()
+
+	res, err = s.next.GetSeats(ctx, eventID, seatIDs)
+	span.SetAttributes(attribute.Int("ticketing.seats.missing", len(res.Missing)))
+	return res, err
+}
+
 // ListSeats implements the use case with tracing.
 func (s *InstrumentedService) ListSeats(ctx context.Context, eventID uuid.UUID) (seats []domain.Seat, err error) {
 	ctx, span := s.tracer.Start(ctx, "EventService.ListSeats", trace.WithAttributes(eventIDKey.String(eventID.String())))

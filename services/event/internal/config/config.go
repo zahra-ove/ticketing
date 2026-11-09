@@ -11,6 +11,7 @@ import (
 // Config is the full service configuration.
 type Config struct {
 	HTTPAddr        string        `env:"HTTP_ADDR"        envDefault:":8080"`
+	GRPCAddr        string        `env:"GRPC_ADDR"        envDefault:":9000"`
 	ShutdownTimeout time.Duration `env:"SHUTDOWN_TIMEOUT" envDefault:"15s"`
 	LogLevel        string        `env:"LOG_LEVEL"        envDefault:"info"`
 	LogFormat       string        `env:"LOG_FORMAT"       envDefault:"json"`

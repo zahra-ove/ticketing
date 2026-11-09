@@ -1,0 +1,51 @@
+syntax = "proto3";
+
+package ticketing.event.v1;
+
+import "google/protobuf/timestamp.proto";
+
+// CatalogService gives other services read access to the event catalog.
+// It is internal: it is not exposed through the API gateway.
+service CatalogService {
+  // GetSeats returns an event and the requested seats of that event.
+  // Seat ids that do not belong to the event are listed in missing_seat_ids
+  // instead of failing the call, so the caller can report exactly which ones.
+  //
+  // Errors: INVALID_ARGUMENT for malformed ids or too many seats,
+  // NOT_FOUND when the event does not exist.
+  rpc GetSeats(GetSeatsRequest) returns (GetSeatsResponse);
+}
+
+enum EventStatus {
+  EVENT_STATUS_UNSPECIFIED = 0;
+  EVENT_STATUS_DRAFT = 1;
+  EVENT_STATUS_PUBLISHED = 2;
+  EVENT_STATUS_CANCELLED = 3;
+}
+
+message Event {
+  string id = 1;
+  string title = 2;
+  google.protobuf.Timestamp starts_at = 3;
+  EventStatus status = 4;
+}
+
+message Seat {
+  string id = 1;
+  // Human-readable position, e.g. "VIP-3-12".
+  string label = 2;
+  // Price in the smallest currency unit.
+  int64 price_cents = 3;
+}
+
+message GetSeatsRequest {
+  string event_id = 1;
+  // At most 100 seat ids.
+  repeated string seat_ids = 2;
+}
+
+message GetSeatsResponse {
+  Event event = 1;
+  repeated Seat seats = 2;
+  repeated string missing_seat_ids = 3;
+}

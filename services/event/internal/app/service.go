@@ -33,6 +33,19 @@ type Repository interface {
 	// ListSeats returns all seats of an event in venue order: by section (as
 	// defined on the event), then row, then seat number.
 	ListSeats(ctx context.Context, eventID uuid.UUID) ([]domain.Seat, error)
+	// GetSeats returns the seats of the event whose ids are in ids; unknown ids are skipped.
+	GetSeats(ctx context.Context, eventID uuid.UUID, ids []uuid.UUID) ([]domain.Seat, error)
+}
+
+// MaxSeatsPerLookup bounds GetSeats so a single call cannot load a whole venue.
+const MaxSeatsPerLookup = 100
+
+// SeatLookup is the result of GetSeats.
+type SeatLookup struct {
+	Event *domain.Event
+	Seats []domain.Seat
+	// Missing lists requested ids that are not seats of the event.
+	Missing []uuid.UUID
 }
 
 // Service implements the event catalog use cases.
@@ -140,6 +153,39 @@ func (s *Service) CancelEvent(ctx context.Context, id uuid.UUID) (*domain.Event,
 		return nil, fmt.Errorf("cancel event %s: %w", id, err)
 	}
 	return ev, nil
+}
+
+// GetSeats returns an event and some of its seats. It serves other services
+// (booking) that need prices and labels of the seats a customer picked.
+func (s *Service) GetSeats(ctx context.Context, eventID uuid.UUID, seatIDs []uuid.UUID) (SeatLookup, error) {
+	if len(seatIDs) == 0 || len(seatIDs) > MaxSeatsPerLookup {
+		return SeatLookup{}, &domain.ValidationError{Fields: map[string]string{
+			"seat_ids": fmt.Sprintf("must contain between 1 and %d ids", MaxSeatsPerLookup),
+		}}
+	}
+
+	ev, err := s.repo.Get(ctx, eventID)
+	if err != nil {
+		return SeatLookup{}, fmt.Errorf("get event %s: %w", eventID, err)
+	}
+
+	seats, err := s.repo.GetSeats(ctx, eventID, seatIDs)
+	if err != nil {
+		return SeatLookup{}, fmt.Errorf("get seats of event %s: %w", eventID, err)
+	}
+
+	found := make(map[uuid.UUID]bool, len(seats))
+	for _, st := range seats {
+		found[st.ID] = true
+	}
+	var missing []uuid.UUID
+	for _, id := range seatIDs {
+		if !found[id] {
+			missing = append(missing, id)
+		}
+	}
+
+	return SeatLookup{Event: ev, Seats: seats, Missing: missing}, nil
 }
 
 // ListSeats returns the seat map of an event.

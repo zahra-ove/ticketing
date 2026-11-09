@@ -182,15 +182,35 @@ func (r *Repository) ListSeats(ctx context.Context, eventID uuid.UUID) ([]domain
 		return nil, fmt.Errorf("query seats: %w", err)
 	}
 
-	seats, err := pgx.CollectRows(rows, func(row pgx.CollectableRow) (domain.Seat, error) {
-		var s domain.Seat
-		err := row.Scan(&s.ID, &s.EventID, &s.Section, &s.Row, &s.Number, &s.PriceCents)
-		return s, err
-	})
+	seats, err := pgx.CollectRows(rows, scanSeat)
 	if err != nil {
 		return nil, fmt.Errorf("scan seats: %w", err)
 	}
 	return seats, nil
+}
+
+// GetSeats implements app.Repository.
+func (r *Repository) GetSeats(ctx context.Context, eventID uuid.UUID, ids []uuid.UUID) ([]domain.Seat, error) {
+	rows, err := r.pool.Query(ctx, `
+		SELECT id, event_id, section, row_number, seat_number, price_cents
+		FROM seats
+		WHERE event_id = $1 AND id = ANY($2)
+		ORDER BY section_index, row_number, seat_number`, eventID, ids)
+	if err != nil {
+		return nil, fmt.Errorf("query seats: %w", err)
+	}
+
+	seats, err := pgx.CollectRows(rows, scanSeat)
+	if err != nil {
+		return nil, fmt.Errorf("scan seats: %w", err)
+	}
+	return seats, nil
+}
+
+func scanSeat(row pgx.CollectableRow) (domain.Seat, error) {
+	var s domain.Seat
+	err := row.Scan(&s.ID, &s.EventID, &s.Section, &s.Row, &s.Number, &s.PriceCents)
+	return s, err
 }
 
 func scanEvent(row pgx.CollectableRow) (domain.Event, error) {

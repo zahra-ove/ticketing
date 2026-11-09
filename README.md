@@ -5,20 +5,27 @@ portfolio project that focuses on the hard parts of distributed systems:
 concurrent seat reservations, distributed transactions (saga), reliable
 messaging (transactional outbox), idempotency and end-to-end observability.
 
-> Status: work in progress. Phases 1–3 are done: repository skeleton, infrastructure, the `event` service and full observability.
+> Status: work in progress. Phases 1–4 are done: infrastructure, observability, the `event` service and the `booking` service with concurrency-safe seat holds.
 
 ## Architecture
 
 | Service | Responsibility | Storage | Talks via |
 |---|---|---|---|
-| `event` | Events, venues and seat catalog | Postgres, Redis cache | HTTP (public), gRPC (internal) |
-| `booking` | Seat holds with TTL, bookings, saga orchestration | Postgres, Redis | gRPC, Kafka |
+| `event` | Events, venues and seat catalog | Postgres | HTTP (public), gRPC (internal) |
+| `booking` | Seat holds with TTL, bookings, saga orchestration | Postgres, Redis | HTTP, gRPC client, Kafka |
 | `payment` | Mock payment provider with idempotency keys | Postgres | Kafka |
 | `notification` | Sends booking emails | — | Kafka |
 
 Infrastructure: Postgres (database per service), Redis, Redpanda (Kafka API),
 Traefik as the API gateway, and an OpenTelemetry pipeline to Prometheus, Tempo,
 Loki and Grafana.
+
+```
+client ──HTTP──▶ booking ──gRPC──▶ event ──▶ Postgres (event)
+                    │
+                    ├──▶ Redis     seat holds (atomic Lua, TTL)
+                    └──▶ Postgres  bookings (unique index: one active booking per seat)
+```
 
 Architecture decisions are recorded in [docs/adr](docs/adr).
 
@@ -52,15 +59,16 @@ make services-up      # builds images, runs migrations, starts everything, waits
 ### Run a service locally (hot path while coding)
 
 ```bash
-make infra-up
-make run-event        # migrates, then serves on http://localhost:8081
+make obs-up           # infrastructure + observability
+make run-event        # migrates, then serves HTTP on :8081 and gRPC on :9000
+make run-booking      # migrates, then serves HTTP on :8082
 ```
 
 ### Tests
 
 ```bash
 make test              # unit tests
-make test-integration  # + repository tests against a real Postgres (testcontainers)
+make test-integration  # + tests against real Postgres and Redis (testcontainers)
 ```
 
 ## Observability
@@ -73,13 +81,15 @@ service ──OTLP──▶ OpenTelemetry Collector ──▶ Tempo       (trace
                                        Grafana ────┘ (all three, linked by trace id)
 ```
 
-- **Traces:** one trace per request: HTTP span → use case span → one span per SQL query.
-- **Metrics:** HTTP RED metrics by route, business counters (`ticketing_events_*`),
-  Postgres pool and Go runtime metrics. Latency histograms carry exemplars that
+- **Traces:** one trace per request across services: HTTP → use case → gRPC → the
+  other service → SQL queries and Redis commands.
+- **Metrics:** HTTP RED metrics by route, business counters (`ticketing_events_*`, `ticketing_holds_*`, `ticketing_bookings_*`),
+  Postgres pool, Redis and Go runtime metrics. Latency histograms carry exemplars that
   link to the trace of a slow request.
 - **Logs:** JSON on stdout and OTLP to Loki; every line inside a request carries
   `trace_id`, so Grafana jumps from a log line to its trace and back.
-- The **Event service** dashboard is provisioned in Grafana under *Ticketing*.
+- The **Service overview** dashboard is provisioned in Grafana under *Ticketing*;
+  pick the service at the top.
 
 See [ADR 4](docs/adr/0004-observability-with-opentelemetry.md) for the reasoning.
 
@@ -110,12 +120,35 @@ curl -i localhost:8081/v1/events -d '{
 }'
 ```
 
+## Booking service API
+
+Customers are identified by the `X-Customer-ID` header (a UUID) until the
+gateway with JWT authentication is added in phase 7.
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/v1/events/{id}/availability` | Booked and currently held seats of an event |
+| `POST` | `/v1/holds` | Hold seats for `HOLD_TTL` (all or nothing); 409 lists taken seats |
+| `GET` | `/v1/holds/{id}` | Get a hold |
+| `DELETE` | `/v1/holds/{id}` | Release a hold early |
+| `POST` | `/v1/bookings` | Turn a hold into a booking; idempotent per hold (201 new, 200 retry) |
+| `GET` | `/v1/bookings/{id}` | Get a booking |
+| `POST` | `/v1/bookings/{id}/cancel` | Cancel an unpaid booking and free its seats |
+
+```bash
+curl -i localhost:8082/v1/holds -H 'X-Customer-ID: 11111111-1111-4111-8111-111111111111'   -d '{"event_id": "<event id>", "seat_ids": ["<seat id>", "<seat id>"]}'
+curl -i localhost:8082/v1/bookings -H 'X-Customer-ID: 11111111-1111-4111-8111-111111111111'   -d '{"hold_id": "<hold id>"}'
+```
+
+How double booking is prevented is explained in
+[ADR 5](docs/adr/0005-seat-holds-in-redis-bookings-in-postgres.md).
+
 ## Repository layout
 
 ```
 services/<name>/        one directory per service (cmd/, internal/, migrations/, Dockerfile)
-pkg/                    small, genuinely shared packages (logging, telemetry, shutdown)
-api/proto/              protobuf contracts
+pkg/                    shared infrastructure: httpx, grpcx, telemetry, logger, postgres, redisx
+api/proto/              protobuf contracts (buf); generated code in api/gen
 deploy/compose/         docker compose files for infrastructure, observability and services
 docs/adr/               architecture decision records
 ```
@@ -125,7 +158,7 @@ docs/adr/               architecture decision records
 - [x] Phase 1 — repository skeleton, tooling, CI, infrastructure
 - [x] Phase 2 — `event` service end to end
 - [x] Phase 3 — observability stack (OpenTelemetry, Prometheus, Tempo, Loki, Grafana)
-- [ ] Phase 4 — `booking` service, gRPC, seat holds in Redis
+- [x] Phase 4 — `booking` service, gRPC, seat holds in Redis
 - [ ] Phase 5 — Kafka, transactional outbox, `payment` service, saga
 - [ ] Phase 6 — `notification` service
 - [ ] Phase 7 — Traefik gateway and JWT authentication

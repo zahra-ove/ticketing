@@ -14,6 +14,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/zahra-ove/ticketing/pkg/httpx"
 	"github.com/zahra-ove/ticketing/services/event/internal/app"
 	"github.com/zahra-ove/ticketing/services/event/internal/domain"
 	"github.com/zahra-ove/ticketing/services/event/internal/transport/httpapi"
@@ -167,8 +168,8 @@ func TestCreateEvent_ValidationErrorListsFields(t *testing.T) {
 	if body.Errors["venue"] != "must not be empty" {
 		t.Errorf("errors = %v", body.Errors)
 	}
-	if body.RequestID == "" || body.RequestID != rec.Header().Get(httpapi.RequestIDHeader) {
-		t.Errorf("request_id = %q, header = %q", body.RequestID, rec.Header().Get(httpapi.RequestIDHeader))
+	if body.RequestID == "" || body.RequestID != rec.Header().Get(httpx.RequestIDHeader) {
+		t.Errorf("request_id = %q, header = %q", body.RequestID, rec.Header().Get(httpx.RequestIDHeader))
 	}
 }
 
@@ -308,12 +309,12 @@ func TestRequestID_IsPropagated(t *testing.T) {
 
 	h := httpapi.NewHandler(stubService{}, stubPinger{}, discard)
 	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/livez", nil)
-	req.Header.Set(httpapi.RequestIDHeader, "abc-123")
+	req.Header.Set(httpx.RequestIDHeader, "abc-123")
 	rec := httptest.NewRecorder()
 
 	h.ServeHTTP(rec, req)
 
-	if got := rec.Header().Get(httpapi.RequestIDHeader); got != "abc-123" {
+	if got := rec.Header().Get(httpx.RequestIDHeader); got != "abc-123" {
 		t.Errorf("request id = %q, want abc-123", got)
 	}
 }

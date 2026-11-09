@@ -50,6 +50,21 @@ jobs:
       - name: govulncheck
         run: go run golang.org/x/vuln/cmd/govulncheck@v1.1.4 ./...
 
+  proto:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # buf breaking compares against main
+      - uses: bufbuild/buf-action@v1
+        with:
+          setup_only: true
+      - name: Lint protobuf
+        run: buf lint
+      - name: Check for breaking changes
+        if: github.event_name == 'pull_request'
+        run: buf breaking --against '.git#branch=origin/main'
+
   compose:
     runs-on: ubuntu-latest
     steps:
@@ -64,4 +79,7 @@ jobs:
       - name: Validate Grafana dashboards
         run: for f in deploy/compose/observability/grafana/dashboards/*.json; do jq empty "$f"; done
       - name: Build service images
-        run: docker build --build-arg SERVICE=event -t ticketing/event:ci .
+        run: |
+          for svc in event booking; do
+            docker build --build-arg SERVICE=$svc -t ticketing/$svc:ci .
+          done

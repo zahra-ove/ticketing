@@ -3,17 +3,14 @@ package httpapi
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"net/http"
 	"strconv"
-	"strings"
-	"time"
 
 	"github.com/google/uuid"
-	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
-	semconv "go.opentelemetry.io/otel/semconv/v1.37.0"
-	"go.opentelemetry.io/otel/trace"
 
+	"github.com/zahra-ove/ticketing/pkg/httpx"
 	"github.com/zahra-ove/ticketing/services/event/internal/app"
 	"github.com/zahra-ove/ticketing/services/event/internal/domain"
 )
@@ -28,85 +25,60 @@ type EventService interface {
 	ListSeats(ctx context.Context, eventID uuid.UUID) ([]domain.Seat, error)
 }
 
-// Pinger reports whether a dependency is reachable. *pgxpool.Pool satisfies it.
-type Pinger interface {
-	Ping(ctx context.Context) error
-}
-
 type handler struct {
 	svc EventService
-	db  Pinger
 	log *slog.Logger
 }
 
-// NewHandler returns the HTTP handler of the event service with all routes and middleware.
-func NewHandler(svc EventService, db Pinger, log *slog.Logger) http.Handler {
-	h := &handler{svc: svc, db: db, log: log}
+// NewHandler returns the HTTP handler of the event service with all routes and
+// middleware. db is checked by the readiness probe; *pgxpool.Pool satisfies it.
+func NewHandler(svc EventService, db httpx.Pinger, log *slog.Logger) http.Handler {
+	h := &handler{svc: svc, log: log}
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /livez", h.livez)
-	mux.HandleFunc("GET /readyz", h.readyz)
+	mux.HandleFunc("GET /livez", httpx.Livez)
+	mux.HandleFunc("GET /readyz", httpx.Readyz(log, map[string]httpx.Pinger{"database": db}))
 
-	route(mux, "POST /v1/events", h.createEvent)
-	route(mux, "GET /v1/events", h.listEvents)
-	route(mux, "GET /v1/events/{id}", h.getEvent)
-	route(mux, "POST /v1/events/{id}/publish", h.publishEvent)
-	route(mux, "POST /v1/events/{id}/cancel", h.cancelEvent)
-	route(mux, "GET /v1/events/{id}/seats", h.listSeats)
+	httpx.Route(mux, "POST /v1/events", h.createEvent)
+	httpx.Route(mux, "GET /v1/events", h.listEvents)
+	httpx.Route(mux, "GET /v1/events/{id}", h.getEvent)
+	httpx.Route(mux, "POST /v1/events/{id}/publish", h.publishEvent)
+	httpx.Route(mux, "POST /v1/events/{id}/cancel", h.cancelEvent)
+	httpx.Route(mux, "GET /v1/events/{id}/seats", h.listSeats)
 
-	// Order matters (outermost last): otelhttp starts the span first, so the
-	// request id, access log and recoverer all run inside it and can log the
-	// trace id; recoverer is innermost so the access log records the 500.
-	var hdl http.Handler = mux
-	hdl = recoverer(log)(hdl)
-	hdl = accessLog(log)(hdl)
-	hdl = requestID(hdl)
-	hdl = otelhttp.NewHandler(hdl, "http.server",
-		otelhttp.WithFilter(func(r *http.Request) bool {
-			return r.URL.Path != "/livez" && r.URL.Path != "/readyz" // probes are noise
-		}),
+	return httpx.Middleware(mux, log)
+}
+
+// writeError maps an error to an HTTP problem response. Unknown errors become
+// 500 and are logged with their full chain; their details never reach the client.
+func (h *handler) writeError(w http.ResponseWriter, r *http.Request, err error) {
+	var (
+		verr *domain.ValidationError
+		berr *httpx.BadRequestError
 	)
-	return hdl
-}
-
-// route registers fn for pattern and names the span and metrics after the
-// route template ("GET /v1/events/{id}"), never the raw path, which would
-// explode metric cardinality with one series per event id.
-func route(mux *http.ServeMux, pattern string, fn http.HandlerFunc) {
-	_, path, _ := strings.Cut(pattern, " ")
-	mux.Handle(pattern, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		span := trace.SpanFromContext(r.Context())
-		span.SetName(pattern)
-		span.SetAttributes(semconv.HTTPRoute(path))
-		if l, ok := otelhttp.LabelerFromContext(r.Context()); ok {
-			l.Add(semconv.HTTPRoute(path))
-		}
-		fn(w, r)
-	}))
-}
-
-// livez reports that the process is up. It never checks dependencies, so a
-// database outage does not make the orchestrator restart healthy containers.
-func (h *handler) livez(w http.ResponseWriter, _ *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
-}
-
-// readyz reports whether the service can serve traffic right now.
-func (h *handler) readyz(w http.ResponseWriter, r *http.Request) {
-	ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
-	defer cancel()
-
-	if err := h.db.Ping(ctx); err != nil {
-		h.log.WarnContext(ctx, "readiness check failed", slog.Any("error", err))
-		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"status": "unavailable", "database": "down"})
-		return
+	switch {
+	case errors.As(err, &berr):
+		httpx.WriteProblem(w, r, httpx.Problem{Status: http.StatusBadRequest, Detail: berr.Msg})
+	case errors.As(err, &verr):
+		httpx.WriteProblem(w, r, httpx.Problem{Status: http.StatusUnprocessableEntity, Detail: "request validation failed", Errors: verr.Fields})
+	case errors.Is(err, domain.ErrNotFound):
+		httpx.WriteProblem(w, r, httpx.Problem{Status: http.StatusNotFound, Detail: domain.ErrNotFound.Error()})
+	case errors.Is(err, domain.ErrInvalidTransition):
+		httpx.WriteProblem(w, r, httpx.Problem{Status: http.StatusConflict, Detail: err.Error()})
+	default:
+		h.log.ErrorContext(r.Context(), "request failed",
+			slog.String("method", r.Method),
+			slog.String("path", r.URL.Path),
+			slog.String("request_id", httpx.RequestIDFrom(r.Context())),
+			slog.Any("error", err),
+		)
+		httpx.WriteProblem(w, r, httpx.Problem{Status: http.StatusInternalServerError})
 	}
-	writeJSON(w, http.StatusOK, map[string]string{"status": "ok", "database": "up"})
 }
 
 func (h *handler) createEvent(w http.ResponseWriter, r *http.Request) {
 	var req createEventRequest
-	if err := decodeJSON(w, r, &req); err != nil {
+	if err := httpx.DecodeJSON(w, r, &req); err != nil {
 		h.writeError(w, r, err)
 		return
 	}
@@ -118,7 +90,7 @@ func (h *handler) createEvent(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Location", "/v1/events/"+ev.ID.String())
-	writeJSON(w, http.StatusCreated, toEventResponse(ev))
+	httpx.WriteJSON(w, http.StatusCreated, toEventResponse(ev))
 }
 
 func (h *handler) getEvent(w http.ResponseWriter, r *http.Request) {
@@ -133,7 +105,7 @@ func (h *handler) getEvent(w http.ResponseWriter, r *http.Request) {
 		h.writeError(w, r, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, toEventResponse(ev))
+	httpx.WriteJSON(w, http.StatusOK, toEventResponse(ev))
 }
 
 func (h *handler) listEvents(w http.ResponseWriter, r *http.Request) {
@@ -143,7 +115,7 @@ func (h *handler) listEvents(w http.ResponseWriter, r *http.Request) {
 	if s := q.Get("limit"); s != "" {
 		n, err := strconv.Atoi(s)
 		if err != nil || n < 1 {
-			h.writeError(w, r, badRequest{"limit must be a positive integer"})
+			h.writeError(w, r, httpx.BadRequest("limit must be a positive integer"))
 			return
 		}
 		limit = n
@@ -159,7 +131,7 @@ func (h *handler) listEvents(w http.ResponseWriter, r *http.Request) {
 	for i := range page.Events {
 		resp.Data[i] = toEventResponse(&page.Events[i])
 	}
-	writeJSON(w, http.StatusOK, resp)
+	httpx.WriteJSON(w, http.StatusOK, resp)
 }
 
 func (h *handler) publishEvent(w http.ResponseWriter, r *http.Request) {
@@ -182,7 +154,7 @@ func (h *handler) transition(w http.ResponseWriter, r *http.Request, fn func(con
 		h.writeError(w, r, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, toEventResponse(ev))
+	httpx.WriteJSON(w, http.StatusOK, toEventResponse(ev))
 }
 
 func (h *handler) listSeats(w http.ResponseWriter, r *http.Request) {
@@ -197,13 +169,13 @@ func (h *handler) listSeats(w http.ResponseWriter, r *http.Request) {
 		h.writeError(w, r, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, listSeatsResponse{Data: toSeatResponses(seats)})
+	httpx.WriteJSON(w, http.StatusOK, listSeatsResponse{Data: toSeatResponses(seats)})
 }
 
 func pathID(r *http.Request) (uuid.UUID, error) {
 	id, err := uuid.Parse(r.PathValue("id"))
 	if err != nil {
-		return uuid.Nil, badRequest{"id must be a valid UUID"}
+		return uuid.Nil, httpx.BadRequest("id must be a valid UUID")
 	}
 	return id, nil
 }

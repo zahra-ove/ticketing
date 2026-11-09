@@ -2,33 +2,30 @@
 //
 // Usage:
 //
-//	event serve        start the HTTP server (default)
+//	event serve        start the HTTP (public) and gRPC (internal) servers (default)
 //	event migrate      apply database migrations and exit
 //	event healthcheck  probe /livez of a running server (for container health checks)
 package main
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"log/slog"
-	"net"
-	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
-	"time"
 
-	"go.opentelemetry.io/contrib/bridges/otelslog"
-	"go.opentelemetry.io/otel"
 	"golang.org/x/sync/errgroup"
 
-	"github.com/zahra-ove/ticketing/pkg/logger"
+	eventv1 "github.com/zahra-ove/ticketing/api/gen/ticketing/event/v1"
+	"github.com/zahra-ove/ticketing/pkg/bootstrap"
+	"github.com/zahra-ove/ticketing/pkg/grpcx"
+	"github.com/zahra-ove/ticketing/pkg/httpx"
 	"github.com/zahra-ove/ticketing/pkg/postgres"
-	"github.com/zahra-ove/ticketing/pkg/telemetry"
 	pgadapter "github.com/zahra-ove/ticketing/services/event/internal/adapter/postgres"
 	"github.com/zahra-ove/ticketing/services/event/internal/app"
 	"github.com/zahra-ove/ticketing/services/event/internal/config"
+	"github.com/zahra-ove/ticketing/services/event/internal/transport/grpcapi"
 	"github.com/zahra-ove/ticketing/services/event/internal/transport/httpapi"
 )
 
@@ -60,41 +57,21 @@ func run() error {
 	}
 
 	if cmd == "healthcheck" {
-		return healthcheck(ctx, cfg.HTTPAddr)
+		return httpx.Healthcheck(ctx, cfg.HTTPAddr)
 	}
 
-	// Telemetry first, so the logger, the pool and the HTTP server are instrumented.
-	// The short-lived migrate job has nothing worth exporting.
-	tel, err := telemetry.Setup(ctx, telemetry.Config{
-		ServiceName:    serviceName,
-		ServiceVersion: version,
-		Disabled:       cfg.TelemetryDisabled || cmd == "migrate",
+	log, flush, err := bootstrap.Observability(ctx, bootstrap.Options{
+		Service:   serviceName,
+		Version:   version,
+		LogLevel:  cfg.LogLevel,
+		LogFormat: cfg.LogFormat,
+		// The short-lived migrate job has nothing worth exporting.
+		TelemetryDisabled: cfg.TelemetryDisabled || cmd == "migrate",
 	})
 	if err != nil {
 		return err
 	}
-	// Deferred first, so it runs last: flushes spans and logs written during shutdown.
-	defer func() {
-		flushCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
-		defer cancel()
-		if err := tel.Shutdown(flushCtx); err != nil {
-			fmt.Fprintf(os.Stderr, "%s: flush telemetry: %v\n", serviceName, err)
-		}
-	}()
-
-	log, err := logger.New(os.Stdout, logger.Config{
-		Level:   cfg.LogLevel,
-		Format:  logger.Format(cfg.LogFormat),
-		Service: serviceName,
-		Version: version,
-	}, otelslog.NewHandler(serviceName, otelslog.WithLoggerProvider(tel.LoggerProvider)))
-	if err != nil {
-		return err
-	}
-	// Report exporter failures (e.g. collector unreachable) through our logger.
-	otel.SetErrorHandler(otel.ErrorHandlerFunc(func(err error) {
-		log.WarnContext(ctx, "opentelemetry error", slog.Any("error", err))
-	}))
+	defer flush() // deferred first, so it runs last and exports what shutdown logged
 
 	pool, err := postgres.NewPool(ctx, postgres.Config{
 		URL:             cfg.DB.URL,
@@ -121,74 +98,22 @@ func run() error {
 		if err != nil {
 			return err
 		}
-		return serve(ctx, cfg, httpapi.NewHandler(svc, pool, log), log)
+		return serve(ctx, cfg, svc, pool, log)
 	default:
 		return fmt.Errorf("unknown command %q (want serve, migrate or healthcheck)", cmd)
 	}
 }
 
-// serve runs the HTTP server until ctx is cancelled, then drains in-flight
-// requests for at most cfg.ShutdownTimeout.
-func serve(ctx context.Context, cfg config.Config, h http.Handler, log *slog.Logger) error {
-	srv := &http.Server{
-		Addr:              cfg.HTTPAddr,
-		Handler:           h,
-		ReadHeaderTimeout: 5 * time.Second,
-		ReadTimeout:       15 * time.Second,
-		WriteTimeout:      15 * time.Second,
-		IdleTimeout:       60 * time.Second,
-		ErrorLog:          slog.NewLogLogger(log.Handler(), slog.LevelError),
-	}
+// serve runs the HTTP and gRPC servers until ctx is cancelled. If either
+// server fails, the other is shut down too.
+func serve(ctx context.Context, cfg config.Config, svc *app.InstrumentedService, db httpx.Pinger, log *slog.Logger) error {
+	httpSrv := httpx.NewServer(cfg.HTTPAddr, httpapi.NewHandler(svc, db, log), log)
+
+	grpcSrv, health := grpcx.NewServer(log)
+	eventv1.RegisterCatalogServiceServer(grpcSrv, grpcapi.NewServer(svc))
 
 	g, gctx := errgroup.WithContext(ctx)
-
-	g.Go(func() error {
-		log.InfoContext(gctx, "http server listening", slog.String("addr", cfg.HTTPAddr))
-		if err := srv.ListenAndServe(); !errors.Is(err, http.ErrServerClosed) {
-			return fmt.Errorf("http server: %w", err)
-		}
-		return nil
-	})
-
-	g.Go(func() error {
-		<-gctx.Done()
-		log.InfoContext(gctx, "shutting down http server")
-
-		// gctx is already cancelled; derive a fresh deadline that keeps its values.
-		shutdownCtx, cancel := context.WithTimeout(context.WithoutCancel(gctx), cfg.ShutdownTimeout)
-		defer cancel()
-		if err := srv.Shutdown(shutdownCtx); err != nil {
-			return fmt.Errorf("shutdown http server: %w", err)
-		}
-		log.InfoContext(shutdownCtx, "http server stopped")
-		return nil
-	})
-
+	g.Go(func() error { return httpx.Run(gctx, httpSrv, cfg.ShutdownTimeout, log) })
+	g.Go(func() error { return grpcx.Run(gctx, grpcSrv, health, cfg.GRPCAddr, cfg.ShutdownTimeout, log) })
 	return g.Wait()
-}
-
-// healthcheck lets a distroless container (no curl, no shell) check itself.
-func healthcheck(ctx context.Context, addr string) error {
-	_, port, err := net.SplitHostPort(addr)
-	if err != nil {
-		return fmt.Errorf("parse HTTP_ADDR %q: %w", addr, err)
-	}
-
-	ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
-	defer cancel()
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://127.0.0.1:"+port+"/livez", http.NoBody)
-	if err != nil {
-		return err
-	}
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return fmt.Errorf("probe /livez: %w", err)
-	}
-	defer func() { _ = resp.Body.Close() }() // nothing useful to do with a close error on a probe
-
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("probe /livez: unexpected status %d", resp.StatusCode)
-	}
-	return nil
 }

@@ -91,6 +91,52 @@ func (r *memRepo) ListSeats(_ context.Context, eventID uuid.UUID) ([]domain.Seat
 	return r.seats[eventID], nil
 }
 
+func (r *memRepo) GetSeats(_ context.Context, eventID uuid.UUID, ids []uuid.UUID) ([]domain.Seat, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	var out []domain.Seat
+	for _, s := range r.seats[eventID] {
+		if slices.Contains(ids, s.ID) {
+			out = append(out, s)
+		}
+	}
+	return out, nil
+}
+
+func TestService_GetSeats(t *testing.T) {
+	t.Parallel()
+	svc := newService(newMemRepo())
+
+	ev, err := svc.CreateEvent(t.Context(), params(time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	all, err := svc.ListSeats(t.Context(), ev.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	unknown := uuid.New()
+
+	res, err := svc.GetSeats(t.Context(), ev.ID, []uuid.UUID{all[0].ID, unknown, all[2].ID})
+	if err != nil {
+		t.Fatalf("GetSeats() error = %v", err)
+	}
+	if res.Event.ID != ev.ID || len(res.Seats) != 2 {
+		t.Errorf("got event %s with %d seats, want %s with 2", res.Event.ID, len(res.Seats), ev.ID)
+	}
+	if len(res.Missing) != 1 || res.Missing[0] != unknown {
+		t.Errorf("missing = %v, want [%s]", res.Missing, unknown)
+	}
+
+	var verr *domain.ValidationError
+	if _, err := svc.GetSeats(t.Context(), ev.ID, nil); !errors.As(err, &verr) {
+		t.Errorf("empty ids error = %v, want *ValidationError", err)
+	}
+	if _, err := svc.GetSeats(t.Context(), uuid.New(), []uuid.UUID{all[0].ID}); !errors.Is(err, domain.ErrNotFound) {
+		t.Errorf("unknown event error = %v, want ErrNotFound", err)
+	}
+}
+
 func newService(repo app.Repository) *app.Service {
 	return app.NewService(repo, app.WithClock(func() time.Time { return now }))
 }
