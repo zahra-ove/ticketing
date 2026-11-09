@@ -18,3 +18,4 @@ EOSQL
 create_service_db event "$EVENT_DB_PASSWORD"
 create_service_db booking "$BOOKING_DB_PASSWORD"
 create_service_db payment "$PAYMENT_DB_PASSWORD"
+create_service_db notification "$NOTIFICATION_DB_PASSWORD"

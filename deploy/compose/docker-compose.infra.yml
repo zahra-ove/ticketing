@@ -13,6 +13,7 @@ services:
       EVENT_DB_PASSWORD: ${EVENT_DB_PASSWORD}
       BOOKING_DB_PASSWORD: ${BOOKING_DB_PASSWORD}
       PAYMENT_DB_PASSWORD: ${PAYMENT_DB_PASSWORD}
+      NOTIFICATION_DB_PASSWORD: ${NOTIFICATION_DB_PASSWORD}
     ports:
       - "${POSTGRES_PORT:-5432}:5432"
     volumes:
@@ -79,6 +80,20 @@ services:
     depends_on:
       redpanda:
         condition: service_healthy
+    networks: [ticketing]
+
+  # Catches every email sent by the notification service; web UI on :8025.
+  mailpit:
+    image: axllent/mailpit:v1.27.7
+    restart: unless-stopped
+    ports:
+      - "${MAILPIT_UI_PORT:-8025}:8025"
+      - "${MAILPIT_SMTP_PORT:-1025}:1025"
+    healthcheck:
+      test: ["CMD", "/mailpit", "readyz"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
     networks: [ticketing]
 
 volumes:

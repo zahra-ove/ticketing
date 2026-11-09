@@ -1,0 +1,8 @@
+Hello,
+
+your booking {{short .BookingID}} was cancelled and its seats were released.
+
+Reason: {{if eq .Reason "customer"}}you cancelled it.{{else if eq .Reason "payment_failed"}}the payment was declined.{{else if eq .Reason "payment_timeout"}}the payment did not arrive in time. If you were charged, the money will be refunded automatically.{{else}}{{.Reason}}{{end}}
+
+Booking reference: {{.BookingID}}
+— Ticketing

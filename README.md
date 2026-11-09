@@ -5,7 +5,7 @@ portfolio project that focuses on the hard parts of distributed systems:
 concurrent seat reservations, distributed transactions (saga), reliable
 messaging (transactional outbox), idempotency and end-to-end observability.
 
-> Status: work in progress. Phases 1–5 are done: infrastructure, observability, the `event`, `booking` and `payment` services, and the payment saga over Kafka.
+> Status: work in progress. Phases 1–6 are done: infrastructure, observability, the `event`, `booking`, `payment` and `notification` services, and the payment saga over Kafka.
 
 ## Architecture
 
@@ -14,7 +14,7 @@ messaging (transactional outbox), idempotency and end-to-end observability.
 | `event` | Events, venues and seat catalog | Postgres | HTTP (public), gRPC (internal) |
 | `booking` | Seat holds with TTL, bookings, saga orchestration | Postgres, Redis | HTTP, gRPC client, Kafka |
 | `payment` | Charges and refunds through a mock provider with idempotency keys | Postgres | Kafka, HTTP (read-only) |
-| `notification` | Sends booking emails | — | Kafka |
+| `notification` | Emails customers about confirmations, cancellations and refunds | Postgres (inbox) | Kafka, SMTP |
 
 Infrastructure: Postgres (database per service), Redis, Redpanda (Kafka API),
 Traefik as the API gateway, and an OpenTelemetry pipeline to Prometheus, Tempo,
@@ -47,6 +47,7 @@ make check      # lint, tests with -race, govulncheck
 | Grafana (dashboards, traces, logs) | http://localhost:3000 |
 | Prometheus | http://localhost:9090 |
 | Redpanda Console (topics, messages) | http://localhost:8085 |
+| Mailpit (emails sent to customers) | http://localhost:8025 |
 | Postgres | `localhost:5432` |
 | Redis | `localhost:6379` |
 | Kafka (from host) | `localhost:19092` |
@@ -164,6 +165,17 @@ declined by the mock provider; `PROVIDER_FAILURE_RATE` injects transient
 errors (retried); stop the payment container to see the timeout and the
 refund compensation. Details in [ADR 6](docs/adr/0006-payment-saga-with-outbox-and-kafka.md).
 
+## Notifications
+
+The notification service consumes booking and payment events and emails the
+customer when a booking is confirmed, cancelled (with the reason) or refunded.
+Every email lands in Mailpit (http://localhost:8025).
+
+Kafka delivers at least once, so the service uses the **inbox pattern**: the
+message id is inserted into an `inbox` table in the same transaction that
+wraps the send, and a message already in the inbox is skipped. Replaying a
+whole topic sends no duplicate emails.
+
 ## Repository layout
 
 ```
@@ -181,6 +193,6 @@ docs/adr/               architecture decision records
 - [x] Phase 3 — observability stack (OpenTelemetry, Prometheus, Tempo, Loki, Grafana)
 - [x] Phase 4 — `booking` service, gRPC, seat holds in Redis
 - [x] Phase 5 — Kafka, transactional outbox, `payment` service, saga
-- [ ] Phase 6 — `notification` service
+- [x] Phase 6 — `notification` service
 - [ ] Phase 7 — Traefik gateway and JWT authentication
 - [ ] Phase 8 — dashboards, load tests, hardening
