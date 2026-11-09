@@ -59,6 +59,9 @@ jobs:
           cp deploy/compose/.env.example deploy/compose/.env
           docker compose --env-file deploy/compose/.env \
             -f deploy/compose/docker-compose.infra.yml \
+            -f deploy/compose/docker-compose.observability.yml \
             -f deploy/compose/docker-compose.services.yml config --quiet
+      - name: Validate Grafana dashboards
+        run: for f in deploy/compose/observability/grafana/dashboards/*.json; do jq empty "$f"; done
       - name: Build service images
         run: docker build --build-arg SERVICE=event -t ticketing/event:ci .

@@ -19,10 +19,13 @@ import (
 	"syscall"
 	"time"
 
+	"go.opentelemetry.io/contrib/bridges/otelslog"
+	"go.opentelemetry.io/otel"
 	"golang.org/x/sync/errgroup"
 
 	"github.com/zahra-ove/ticketing/pkg/logger"
 	"github.com/zahra-ove/ticketing/pkg/postgres"
+	"github.com/zahra-ove/ticketing/pkg/telemetry"
 	pgadapter "github.com/zahra-ove/ticketing/services/event/internal/adapter/postgres"
 	"github.com/zahra-ove/ticketing/services/event/internal/app"
 	"github.com/zahra-ove/ticketing/services/event/internal/config"
@@ -60,15 +63,38 @@ func run() error {
 		return healthcheck(ctx, cfg.HTTPAddr)
 	}
 
+	// Telemetry first, so the logger, the pool and the HTTP server are instrumented.
+	// The short-lived migrate job has nothing worth exporting.
+	tel, err := telemetry.Setup(ctx, telemetry.Config{
+		ServiceName:    serviceName,
+		ServiceVersion: version,
+		Disabled:       cfg.TelemetryDisabled || cmd == "migrate",
+	})
+	if err != nil {
+		return err
+	}
+	// Deferred first, so it runs last: flushes spans and logs written during shutdown.
+	defer func() {
+		flushCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+		defer cancel()
+		if err := tel.Shutdown(flushCtx); err != nil {
+			fmt.Fprintf(os.Stderr, "%s: flush telemetry: %v\n", serviceName, err)
+		}
+	}()
+
 	log, err := logger.New(os.Stdout, logger.Config{
 		Level:   cfg.LogLevel,
 		Format:  logger.Format(cfg.LogFormat),
 		Service: serviceName,
 		Version: version,
-	})
+	}, otelslog.NewHandler(serviceName, otelslog.WithLoggerProvider(tel.LoggerProvider)))
 	if err != nil {
 		return err
 	}
+	// Report exporter failures (e.g. collector unreachable) through our logger.
+	otel.SetErrorHandler(otel.ErrorHandlerFunc(func(err error) {
+		log.WarnContext(ctx, "opentelemetry error", slog.Any("error", err))
+	}))
 
 	pool, err := postgres.NewPool(ctx, postgres.Config{
 		URL:             cfg.DB.URL,
@@ -91,7 +117,10 @@ func run() error {
 		log.InfoContext(ctx, "migrations applied", slog.Int("count", n))
 		return nil
 	case "serve":
-		svc := app.NewService(pgadapter.NewRepository(pool))
+		svc, err := app.NewInstrumentedService(app.NewService(pgadapter.NewRepository(pool)))
+		if err != nil {
+			return err
+		}
 		return serve(ctx, cfg, httpapi.NewHandler(svc, pool, log), log)
 	default:
 		return fmt.Errorf("unknown command %q (want serve, migrate or healthcheck)", cmd)

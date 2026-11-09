@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/exaring/otelpgx"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -37,9 +38,18 @@ func NewPool(ctx context.Context, cfg Config) (*pgxpool.Pool, error) {
 		pcfg.MaxConnIdleTime = cfg.MaxConnIdleTime
 	}
 
+	// One span per query, using the globally registered tracer provider.
+	pcfg.ConnConfig.Tracer = otelpgx.NewTracer(otelpgx.WithTrimSQLInSpanName())
+
 	pool, err := pgxpool.NewWithConfig(ctx, pcfg)
 	if err != nil {
 		return nil, fmt.Errorf("create pool: %w", err)
+	}
+
+	// Pool metrics: connections in use, idle, waiting, acquire duration.
+	if err := otelpgx.RecordStats(pool); err != nil {
+		pool.Close()
+		return nil, fmt.Errorf("record pool stats: %w", err)
 	}
 
 	pingCtx, cancel := context.WithTimeout(ctx, 5*time.Second)

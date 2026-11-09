@@ -6,9 +6,13 @@ import (
 	"log/slog"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
+	semconv "go.opentelemetry.io/otel/semconv/v1.37.0"
+	"go.opentelemetry.io/otel/trace"
 
 	"github.com/zahra-ove/ticketing/services/event/internal/app"
 	"github.com/zahra-ove/ticketing/services/event/internal/domain"
@@ -43,20 +47,42 @@ func NewHandler(svc EventService, db Pinger, log *slog.Logger) http.Handler {
 	mux.HandleFunc("GET /livez", h.livez)
 	mux.HandleFunc("GET /readyz", h.readyz)
 
-	mux.HandleFunc("POST /v1/events", h.createEvent)
-	mux.HandleFunc("GET /v1/events", h.listEvents)
-	mux.HandleFunc("GET /v1/events/{id}", h.getEvent)
-	mux.HandleFunc("POST /v1/events/{id}/publish", h.publishEvent)
-	mux.HandleFunc("POST /v1/events/{id}/cancel", h.cancelEvent)
-	mux.HandleFunc("GET /v1/events/{id}/seats", h.listSeats)
+	route(mux, "POST /v1/events", h.createEvent)
+	route(mux, "GET /v1/events", h.listEvents)
+	route(mux, "GET /v1/events/{id}", h.getEvent)
+	route(mux, "POST /v1/events/{id}/publish", h.publishEvent)
+	route(mux, "POST /v1/events/{id}/cancel", h.cancelEvent)
+	route(mux, "GET /v1/events/{id}/seats", h.listSeats)
 
-	// Order matters: request id first so every later layer can log it,
-	// recoverer innermost so the access log records the 500.
+	// Order matters (outermost last): otelhttp starts the span first, so the
+	// request id, access log and recoverer all run inside it and can log the
+	// trace id; recoverer is innermost so the access log records the 500.
 	var hdl http.Handler = mux
 	hdl = recoverer(log)(hdl)
 	hdl = accessLog(log)(hdl)
 	hdl = requestID(hdl)
+	hdl = otelhttp.NewHandler(hdl, "http.server",
+		otelhttp.WithFilter(func(r *http.Request) bool {
+			return r.URL.Path != "/livez" && r.URL.Path != "/readyz" // probes are noise
+		}),
+	)
 	return hdl
+}
+
+// route registers fn for pattern and names the span and metrics after the
+// route template ("GET /v1/events/{id}"), never the raw path, which would
+// explode metric cardinality with one series per event id.
+func route(mux *http.ServeMux, pattern string, fn http.HandlerFunc) {
+	_, path, _ := strings.Cut(pattern, " ")
+	mux.Handle(pattern, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		span := trace.SpanFromContext(r.Context())
+		span.SetName(pattern)
+		span.SetAttributes(semconv.HTTPRoute(path))
+		if l, ok := otelhttp.LabelerFromContext(r.Context()); ok {
+			l.Add(semconv.HTTPRoute(path))
+		}
+		fn(w, r)
+	}))
 }
 
 // livez reports that the process is up. It never checks dependencies, so a

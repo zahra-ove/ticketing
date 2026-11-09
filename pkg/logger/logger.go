@@ -34,7 +34,11 @@ type Config struct {
 }
 
 // New returns a logger that writes to w according to cfg.
-func New(w io.Writer, cfg Config) (*slog.Logger, error) {
+//
+// Lines written to w get the trace_id and span_id of the active span, so a
+// log line can be matched to its trace. Every record is also passed to the
+// extra handlers (for example the OpenTelemetry slog bridge) at the same level.
+func New(w io.Writer, cfg Config, extra ...slog.Handler) (*slog.Logger, error) {
 	var level slog.Level
 	if err := level.UnmarshalText([]byte(cfg.Level)); err != nil {
 		return nil, fmt.Errorf("parse log level %q: %w", cfg.Level, err)
@@ -52,8 +56,18 @@ func New(w io.Writer, cfg Config) (*slog.Logger, error) {
 		return nil, fmt.Errorf("unsupported log format %q", cfg.Format)
 	}
 
-	return slog.New(h).With(
+	// service and version go only to stdout: OTLP records carry them as resource attributes.
+	stdout := traceContextHandler{h}.WithAttrs([]slog.Attr{
 		slog.String("service", cfg.Service),
 		slog.String("version", cfg.Version),
-	), nil
+	})
+	if len(extra) == 0 {
+		return slog.New(stdout), nil
+	}
+
+	handlers := []slog.Handler{stdout}
+	for _, e := range extra {
+		handlers = append(handlers, levelHandler{Handler: e, level: level})
+	}
+	return slog.New(fanoutHandler(handlers)), nil
 }

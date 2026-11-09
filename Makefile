@@ -4,11 +4,13 @@ SHELL := bash
 COMPOSE_DIR  := deploy/compose
 COMPOSE_ENV  := --env-file $(COMPOSE_DIR)/.env
 INFRA        := docker compose $(COMPOSE_ENV) -f $(COMPOSE_DIR)/docker-compose.infra.yml
-STACK        := $(INFRA) -f $(COMPOSE_DIR)/docker-compose.services.yml
+OBS          := docker compose $(COMPOSE_ENV) -f $(COMPOSE_DIR)/docker-compose.infra.yml -f $(COMPOSE_DIR)/docker-compose.observability.yml
+STACK        := $(OBS) -f $(COMPOSE_DIR)/docker-compose.services.yml
 
 # Local run of the event service against the infra started by `make infra-up`.
 EVENT_ENV := DB_URL=postgres://event:event@localhost:5432/event?sslmode=disable \
-             HTTP_ADDR=:8081 LOG_FORMAT=text LOG_LEVEL=debug
+             HTTP_ADDR=:8081 LOG_FORMAT=text LOG_LEVEL=debug \
+             OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317 OTEL_METRIC_EXPORT_INTERVAL=10000
 
 # The race detector needs cgo (a C compiler). Enable it only when gcc exists,
 # so `make test` also works on Windows machines without a toolchain. CI always has it.
@@ -98,6 +100,16 @@ infra-ps: ## Show infrastructure containers
 .PHONY: infra-logs
 infra-logs: ## Follow infrastructure logs
 	$(INFRA) logs -f
+
+##@ Observability
+
+.PHONY: obs-up
+obs-up: $(COMPOSE_DIR)/.env ## Start infrastructure plus the collector, Prometheus, Tempo, Loki and Grafana
+	$(OBS) up -d --wait
+
+.PHONY: obs-down
+obs-down: ## Stop infrastructure and observability stack
+	$(OBS) down
 
 ##@ Services
 

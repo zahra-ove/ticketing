@@ -8,6 +8,8 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 )
 
 // RequestIDHeader carries the request id between clients and services.
@@ -30,6 +32,8 @@ func requestID(next http.Handler) http.Handler {
 			id = uuid.NewString()
 		}
 		w.Header().Set(RequestIDHeader, id)
+		// Lets you find a trace in Tempo from the request id a client reports.
+		trace.SpanFromContext(r.Context()).SetAttributes(attribute.String("http.request.id", id))
 		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), ctxKey{}, id)))
 	})
 }

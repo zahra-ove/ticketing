@@ -5,7 +5,7 @@ portfolio project that focuses on the hard parts of distributed systems:
 concurrent seat reservations, distributed transactions (saga), reliable
 messaging (transactional outbox), idempotency and end-to-end observability.
 
-> Status: work in progress. Phases 1–2 are done: repository skeleton, infrastructure and the `event` service.
+> Status: work in progress. Phases 1–3 are done: repository skeleton, infrastructure, the `event` service and full observability.
 
 ## Architecture
 
@@ -34,6 +34,8 @@ make check      # lint, tests with -race, govulncheck
 
 | Tool | URL |
 |---|---|
+| Grafana (dashboards, traces, logs) | http://localhost:3000 |
+| Prometheus | http://localhost:9090 |
 | Redpanda Console | http://localhost:8085 |
 | Postgres | `localhost:5432` |
 | Redis | `localhost:6379` |
@@ -60,6 +62,26 @@ make run-event        # migrates, then serves on http://localhost:8081
 make test              # unit tests
 make test-integration  # + repository tests against a real Postgres (testcontainers)
 ```
+
+## Observability
+
+```
+service ──OTLP──▶ OpenTelemetry Collector ──▶ Tempo       (traces)
+                                         ├──▶ Prometheus  (metrics)
+                                         └──▶ Loki        (logs)
+                                                   ▲
+                                       Grafana ────┘ (all three, linked by trace id)
+```
+
+- **Traces:** one trace per request: HTTP span → use case span → one span per SQL query.
+- **Metrics:** HTTP RED metrics by route, business counters (`ticketing_events_*`),
+  Postgres pool and Go runtime metrics. Latency histograms carry exemplars that
+  link to the trace of a slow request.
+- **Logs:** JSON on stdout and OTLP to Loki; every line inside a request carries
+  `trace_id`, so Grafana jumps from a log line to its trace and back.
+- The **Event service** dashboard is provisioned in Grafana under *Ticketing*.
+
+See [ADR 4](docs/adr/0004-observability-with-opentelemetry.md) for the reasoning.
 
 ## Event service API
 
@@ -102,7 +124,7 @@ docs/adr/               architecture decision records
 
 - [x] Phase 1 — repository skeleton, tooling, CI, infrastructure
 - [x] Phase 2 — `event` service end to end
-- [ ] Phase 3 — observability stack (OpenTelemetry, Prometheus, Tempo, Loki, Grafana)
+- [x] Phase 3 — observability stack (OpenTelemetry, Prometheus, Tempo, Loki, Grafana)
 - [ ] Phase 4 — `booking` service, gRPC, seat holds in Redis
 - [ ] Phase 5 — Kafka, transactional outbox, `payment` service, saga
 - [ ] Phase 6 — `notification` service

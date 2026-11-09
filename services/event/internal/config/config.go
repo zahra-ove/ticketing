@@ -14,7 +14,10 @@ type Config struct {
 	ShutdownTimeout time.Duration `env:"SHUTDOWN_TIMEOUT" envDefault:"15s"`
 	LogLevel        string        `env:"LOG_LEVEL"        envDefault:"info"`
 	LogFormat       string        `env:"LOG_FORMAT"       envDefault:"json"`
-	DB              DB            `envPrefix:"DB_"`
+	// TelemetryDisabled uses the standard OpenTelemetry variable. Exporter
+	// settings are read by the SDK itself from the other OTEL_* variables.
+	TelemetryDisabled bool `env:"OTEL_SDK_DISABLED" envDefault:"false"`
+	DB                DB   `envPrefix:"DB_"`
 }
 
 // DB holds the Postgres connection settings.
