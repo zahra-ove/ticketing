@@ -1,0 +1,64 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - uses: golangci/golangci-lint-action@v8
+        with:
+          version: v2.4.0
+          args: --build-tags integration
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Verify go.mod is tidy
+        run: go mod tidy -diff
+      - name: Build
+        run: go build ./...
+      - name: Test (unit + integration)
+        # GitHub runners have Docker, so testcontainers can start real Postgres here.
+        run: go test -race -count=1 -tags integration -coverprofile=coverage.out ./...
+
+  vuln:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: govulncheck
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.1.4 ./...
+
+  compose:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate compose files
+        run: |
+          cp deploy/compose/.env.example deploy/compose/.env
+          docker compose --env-file deploy/compose/.env \
+            -f deploy/compose/docker-compose.infra.yml \
+            -f deploy/compose/docker-compose.services.yml config --quiet
+      - name: Build service images
+        run: docker build --build-arg SERVICE=event -t ticketing/event:ci .

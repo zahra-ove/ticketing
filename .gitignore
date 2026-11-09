@@ -1,0 +1,19 @@
+# Binaries
+/bin/
+*.exe
+*.test
+*.out
+
+# Coverage
+coverage.*
+
+# Local env files (keep the examples)
+.env
+*.env
+!*.env.example
+!.env.example
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store

@@ -1,0 +1,113 @@
+package httpapi
+
+import (
+	"context"
+	"log/slog"
+	"net/http"
+	"runtime/debug"
+	"time"
+
+	"github.com/google/uuid"
+)
+
+// RequestIDHeader carries the request id between clients and services.
+const RequestIDHeader = "X-Request-ID"
+
+type ctxKey struct{}
+
+// RequestIDFrom returns the request id stored in ctx, or "".
+func RequestIDFrom(ctx context.Context) string {
+	id, _ := ctx.Value(ctxKey{}).(string)
+	return id
+}
+
+// requestID reuses a well-formed incoming request id or creates a new one, and
+// echoes it in the response so that clients can quote it in bug reports.
+func requestID(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		id := r.Header.Get(RequestIDHeader)
+		if id == "" || len(id) > 64 {
+			id = uuid.NewString()
+		}
+		w.Header().Set(RequestIDHeader, id)
+		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), ctxKey{}, id)))
+	})
+}
+
+// statusRecorder captures the status code and size written by a handler.
+type statusRecorder struct {
+	http.ResponseWriter
+	status int
+	bytes  int
+}
+
+func (s *statusRecorder) WriteHeader(code int) {
+	s.status = code
+	s.ResponseWriter.WriteHeader(code)
+}
+
+func (s *statusRecorder) Write(b []byte) (int, error) {
+	if s.status == 0 {
+		s.status = http.StatusOK
+	}
+	n, err := s.ResponseWriter.Write(b)
+	s.bytes += n
+	return n, err
+}
+
+// Unwrap lets http.ResponseController reach the underlying writer.
+func (s *statusRecorder) Unwrap() http.ResponseWriter { return s.ResponseWriter }
+
+// accessLog logs one line per request. Health probes are skipped to keep the logs readable.
+func accessLog(log *slog.Logger) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path == "/livez" || r.URL.Path == "/readyz" {
+				next.ServeHTTP(w, r)
+				return
+			}
+
+			start := time.Now()
+			rec := &statusRecorder{ResponseWriter: w}
+			next.ServeHTTP(rec, r)
+
+			level := slog.LevelInfo
+			if rec.status >= http.StatusInternalServerError {
+				level = slog.LevelError
+			}
+			log.LogAttrs(r.Context(), level, "http request",
+				slog.String("method", r.Method),
+				slog.String("path", r.URL.Path),
+				slog.Int("status", rec.status),
+				slog.Int("bytes", rec.bytes),
+				slog.Float64("duration_ms", float64(time.Since(start).Microseconds())/1000),
+				slog.String("request_id", RequestIDFrom(r.Context())),
+			)
+		})
+	}
+}
+
+// recoverer turns a panic into a 500 response instead of a dropped connection.
+func recoverer(log *slog.Logger) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			defer func() { //nolint:contextcheck // false positive: the closure uses r.Context()
+				rec := recover()
+				if rec == nil {
+					return
+				}
+				// http.ErrAbortHandler is the documented way to abort a response; let it through.
+				if rec == http.ErrAbortHandler { //nolint:errorlint // panic values are compared directly
+					panic(rec)
+				}
+				log.ErrorContext(r.Context(), "panic recovered",
+					slog.Any("panic", rec),
+					slog.String("stack", string(debug.Stack())),
+					slog.String("request_id", RequestIDFrom(r.Context())),
+				)
+				writeProblem(w, r, problem{Status: http.StatusInternalServerError})
+			}()
+			next.ServeHTTP(w, r)
+		})
+	}
+}
