@@ -1,219 +1,221 @@
 # ticketing
 
-An event ticketing platform built as a set of Go microservices. It is a
-portfolio project that focuses on the hard parts of distributed systems:
-concurrent seat reservations, distributed transactions (saga), reliable
-messaging (transactional outbox), idempotency and end-to-end observability.
+An event ticketing platform built as Go microservices. Customers hold seats,
+book them, and pay; many customers race for the same seats, services fail and
+recover, and no seat is ever sold twice.
 
-> Status: work in progress. Phases 1–7 are done: services, payment saga over Kafka, notifications, observability, and a gateway with JWT authentication.
+The project is about the hard parts of distributed systems, done the way the
+Go community writes services:
+
+- **Concurrency-safe seat reservation:** atomic all-or-nothing holds in Redis
+  (Lua), and a Postgres unique index as the final guard.
+- **A payment saga over Kafka:** choreographed, with a transactional outbox,
+  an inbox, retries, dead-letter topics, a timeout and a compensating refund.
+- **Idempotency end to end:** retried requests and redelivered messages never
+  book, charge or email twice.
+- **Security at the edge:** a Traefik gateway, Ed25519 JWTs, ForwardAuth,
+  roles and rate limits.
+- **Observability:** OpenTelemetry traces that follow a request across HTTP,
+  gRPC and Kafka, RED and business metrics, correlated logs, dashboards and alerts.
+
+Load-tested with k6: 200 concurrent customers on 200 seats, 0 server errors,
+**0 seats sold twice** ([results and bottleneck analysis](docs/load-test.md)).
+
+## Quick start
+
+Prerequisites: Docker with Compose v2, Make, Go 1.26+ (only for running tests
+locally), and `bash` (Git Bash on Windows).
+
+```bash
+make services-up   # builds 5 services, starts ~20 containers, waits until all are healthy
+make demo          # guided tour: login, roles, holds, booking, saga, declined card
+```
+
+| What | URL |
+|---|---|
+| **API gateway** (every API call) | http://localhost:8000 |
+| Grafana: dashboards, traces, logs | http://localhost:3000 |
+| Mailpit: emails sent to customers | http://localhost:8025 |
+| Redpanda Console: Kafka topics and messages | http://localhost:8085 |
+| Traefik dashboard: routes and middlewares | http://localhost:8090 |
+| Prometheus: metrics and alerts | http://localhost:9090 |
+
+`make` lists every target. `make services-down` stops everything.
 
 ## Architecture
 
+```mermaid
+flowchart LR
+    client([client]) -->|HTTP + JWT| gw[Traefik gateway]
+    gw -->|ForwardAuth| auth[auth]
+    gw --> event[event]
+    gw --> booking[booking]
+    gw --> payment[payment]
+
+    booking -->|gRPC| event
+    event --> pgE[(Postgres<br/>events, seats)]
+    booking --> redis[(Redis<br/>seat holds)]
+    booking --> pgB[(Postgres<br/>bookings + outbox)]
+    payment --> pgP[(Postgres<br/>payments + outbox)]
+    notification[notification] --> pgN[(Postgres<br/>inbox)]
+    notification -->|SMTP| mail[Mailpit]
+
+    booking <-->|booking / payment events| kafka{{Kafka / Redpanda}}
+    payment <--> kafka
+    kafka --> notification
+```
+
 | Service | Responsibility | Storage | Talks via |
 |---|---|---|---|
-| `event` | Events, venues and seat catalog | Postgres | HTTP (public), gRPC (internal) |
-| `booking` | Seat holds with TTL, bookings, saga orchestration | Postgres, Redis | HTTP, gRPC client, Kafka |
-| `payment` | Charges and refunds through a mock provider with idempotency keys | Postgres | Kafka, HTTP (read-only) |
-| `notification` | Emails customers about confirmations, cancellations and refunds | Postgres (inbox) | Kafka, SMTP |
+| `auth` | Login, Ed25519 JWTs, JWKS, ForwardAuth for the gateway | — | HTTP |
+| `event` | Events, venues, seat catalog | Postgres | HTTP (public), gRPC (internal) |
+| `booking` | Seat holds, bookings, saga steps, payment timeout | Postgres, Redis | HTTP, gRPC client, Kafka |
+| `payment` | Charges and refunds through a mock provider | Postgres | Kafka, HTTP (read-only) |
+| `notification` | Emails on confirmation, cancellation, refund | Postgres (inbox) | Kafka, SMTP |
 
-Infrastructure: Postgres (database per service), Redis, Redpanda (Kafka API),
-Traefik as the API gateway, and an OpenTelemetry pipeline to Prometheus, Tempo,
-Loki and Grafana.
+Each service owns its database. Services talk synchronously only where an
+answer is needed right away (booking asks the catalog for seat prices over
+gRPC) and asynchronously everywhere else.
 
-```
-client ──HTTP──▶ booking ──gRPC──▶ event ──▶ Postgres (event)
-                    │
-                    ├──▶ Redis     seat holds (atomic Lua, TTL)
-                    ├──▶ Postgres  bookings + outbox
-                    │
-                    └── Kafka (Redpanda) ◀──▶ payment ──▶ Postgres (payments + outbox)
-                        booking events / payment events  (choreographed saga)
-```
+### Life of a booking
 
-Architecture decisions are recorded in [docs/adr](docs/adr).
+1. The customer **holds** seats: booking asks event (gRPC) for prices, checks
+   Postgres for sold seats, then a Lua script in Redis locks every seat or none,
+   with a TTL.
+2. The customer **books** the hold: booking writes the booking and a
+   `BookingCreated` event into its outbox **in one transaction**. A unique index
+   makes it impossible for a seat to be in two active bookings.
+3. The outbox relay publishes to Kafka. **Payment** charges the customer (with an
+   idempotency key) and publishes `PaymentSucceeded` or `PaymentFailed`.
+4. Booking **confirms** the booking, or **cancels** it and frees the seats.
+   Unpaid bookings are cancelled after `PAYMENT_TIMEOUT`; a payment that arrives
+   for a cancelled booking is **refunded** (compensation).
+5. **Notification** emails the customer, exactly once per event (inbox).
 
-## Getting started
+The whole chain, minutes apart if a service was down, shows up as **one trace**
+in Grafana.
 
-Prerequisites: Go 1.25+, Docker with Compose v2, Make, and
-[golangci-lint v2](https://golangci-lint.run/) (`make tools`).
+## Design decisions
 
-```bash
-make infra-up   # Postgres, Redis, Redpanda and Redpanda Console
-make check      # lint, tests with -race, govulncheck
-```
+Every significant choice has an Architecture Decision Record:
 
-| Tool | URL |
+| ADR | Decision |
 |---|---|
-| **API gateway** (all API calls) | http://localhost:8000 |
-| Traefik dashboard | http://localhost:8090 |
-| Grafana (dashboards, traces, logs) | http://localhost:3000 |
-| Prometheus | http://localhost:9090 |
-| Redpanda Console (topics, messages) | http://localhost:8085 |
-| Mailpit (emails sent to customers) | http://localhost:8025 |
-| Postgres | `localhost:5432` |
-| Redis | `localhost:6379` |
-| Kafka (from host) | `localhost:19092` |
+| [1](docs/adr/0001-record-architecture-decisions.md) | Record architecture decisions |
+| [2](docs/adr/0002-monorepo-single-go-module.md) | Monorepo with a single Go module; `internal/` keeps services apart |
+| [3](docs/adr/0003-hand-written-sql-with-pgx.md) | Hand-written SQL with pgx, embedded goose migrations |
+| [4](docs/adr/0004-observability-with-opentelemetry.md) | OpenTelemetry for traces, metrics and logs; one collector |
+| [5](docs/adr/0005-seat-holds-in-redis-bookings-in-postgres.md) | Seat holds in Redis, bookings guarded by a Postgres unique index |
+| [6](docs/adr/0006-payment-saga-with-outbox-and-kafka.md) | Choreographed payment saga with a transactional outbox |
+| [7](docs/adr/0007-gateway-and-authentication.md) | Traefik gateway, ForwardAuth and Ed25519 JWTs |
 
-Run `make` to see every target.
+## Using the API
 
-### Run the whole stack in Docker
-
-```bash
-make services-up      # builds images, runs migrations, starts everything, waits until healthy
-```
-
-### Run a service locally (hot path while coding)
+Everything goes through the gateway. Reading the catalog is public; the rest
+needs a bearer token.
 
 ```bash
-make obs-up           # infrastructure + observability
-make run-event        # migrates, then serves HTTP on :8081 and gRPC on :9000
-make run-booking      # migrates, then serves HTTP on :8082
-```
-
-### Tests
-
-```bash
-make test              # unit tests
-make test-integration  # + tests against real Postgres and Redis (testcontainers)
-```
-
-## Observability
-
-```
-service ──OTLP──▶ OpenTelemetry Collector ──▶ Tempo       (traces)
-                                         ├──▶ Prometheus  (metrics)
-                                         └──▶ Loki        (logs)
-                                                   ▲
-                                       Grafana ────┘ (all three, linked by trace id)
-```
-
-- **Traces:** one trace per request across services: HTTP → use case → gRPC → the
-  other service → SQL queries and Redis commands.
-- **Metrics:** HTTP RED metrics by route, business counters (`ticketing_events_*`, `ticketing_holds_*`, `ticketing_bookings_*`),
-  Postgres pool, Redis and Go runtime metrics. Latency histograms carry exemplars that
-  link to the trace of a slow request.
-- **Logs:** JSON on stdout and OTLP to Loki; every line inside a request carries
-  `trace_id`, so Grafana jumps from a log line to its trace and back.
-- The **Service overview** dashboard is provisioned in Grafana under *Ticketing*;
-  pick the service at the top.
-
-See [ADR 4](docs/adr/0004-observability-with-opentelemetry.md) for the reasoning.
-
-## Authentication
-
-All API calls go through the gateway on `:8000`; services have no public
-ports. Get a token, then send it as a bearer token:
-
-```bash
-TOKEN=$(curl -s localhost:8000/v1/token -d '{"username":"admin","password":"admin-secret"}' | jq -r .access_token)
-curl -H "Authorization: Bearer $TOKEN" localhost:8000/v1/events -d '{...}'
+TOKEN=$(curl -s localhost:8000/v1/token -d '{"username":"alice","password":"demo-secret"}' | jq -r .access_token)
+curl -H "Authorization: Bearer $TOKEN" localhost:8000/v1/holds \
+  -d '{"event_id": "<event id>", "seat_ids": ["<seat id>"]}'
 ```
 
 | User | Password | Role |
 |---|---|---|
 | `admin` | `admin-secret` | admin: manages the catalog, reads all payments |
 | `alice`, `bob` | `demo-secret` | customer |
-| `customer-<anything>` | `demo-secret` | customer (only with `DEMO_SIGNUP=true`, for load tests) |
+| `customer-<anything>` | `demo-secret` | customer, only with `DEMO_SIGNUP=true` (load tests) |
 
-Reading the catalog needs no token. The gateway strips identity headers sent
-by clients and sets them only from a verified token; see
-[ADR 7](docs/adr/0007-gateway-and-authentication.md).
+| Method | Path | Who | Description |
+|---|---|---|---|
+| `POST` | `/v1/token` | anyone | Log in, get a 15-minute JWT |
+| `GET` | `/.well-known/jwks.json` | anyone | Public key to verify tokens |
+| `GET` | `/v1/events`, `/v1/events/{id}`, `/v1/events/{id}/seats` | anyone | Catalog (keyset pagination: `?limit=&cursor=`) |
+| `POST` | `/v1/events`, `/v1/events/{id}/publish`, `/v1/events/{id}/cancel` | admin | Manage events |
+| `GET` | `/v1/events/{id}/availability` | customer | Booked and held seats |
+| `POST` | `/v1/holds` | customer | Hold seats (all or nothing); `409` lists taken seats |
+| `GET`, `DELETE` | `/v1/holds/{id}` | owner | Read or release a hold |
+| `POST` | `/v1/bookings` | customer | Book a hold; idempotent (`201` new, `200` retry) |
+| `GET` | `/v1/bookings/{id}` | owner | Booking with status and cancel reason |
+| `POST` | `/v1/bookings/{id}/cancel` | owner | Cancel an unpaid booking |
+| `GET` | `/v1/payments?booking_id=` | owner, admin | Payment of a booking |
 
-## Event service API
+Errors are [RFC 9457 problem details](https://www.rfc-editor.org/rfc/rfc9457)
+with the request id. Other people's bookings and payments answer `404`, so ids
+cannot be probed.
 
-| Method | Path | Description |
-|---|---|---|
-| `POST` | `/v1/events` | Create a draft event and generate its seats |
-| `GET` | `/v1/events?limit=&cursor=` | List published events (keyset pagination) |
-| `GET` | `/v1/events/{id}` | Get one event |
-| `POST` | `/v1/events/{id}/publish` | Publish a draft event |
-| `POST` | `/v1/events/{id}/cancel` | Cancel an event |
-| `GET` | `/v1/events/{id}/seats` | Seat map of an event |
-| `GET` | `/livez`, `/readyz` | Liveness and readiness probes |
+**Try the failure paths:** prices ending in `.13` (e.g. `2513` cents) are
+declined; `PROVIDER_FAILURE_RATE` injects transient payment errors (retried);
+stopping the payment container shows the timeout and the refund.
 
-Errors use [RFC 9457 problem details](https://www.rfc-editor.org/rfc/rfc9457)
-(`application/problem+json`) and carry the `X-Request-ID` of the request.
+## Observability
 
-```bash
-curl -i localhost:8000/v1/events -H "Authorization: Bearer $ADMIN_TOKEN" -d '{
-  "title": "GopherCon Tehran",
-  "venue": "Milad Tower",
-  "starts_at": "2027-03-01T17:00:00Z",
-  "sections": [
-    {"name": "VIP", "rows": 2, "seats_per_row": 10, "price_cents": 5000},
-    {"name": "Standard", "rows": 20, "seats_per_row": 30, "price_cents": 2000}
-  ]
-}'
+```
+gateway + services ──OTLP──▶ OpenTelemetry Collector ──▶ Tempo       traces
+                                                    ├──▶ Prometheus  metrics + alerts
+                                                    └──▶ Loki        logs
+                                         Grafana reads all three, linked by trace id
 ```
 
-## Booking service API
+- **Traces** start at the gateway and follow the request through ForwardAuth,
+  the services, gRPC, SQL, Redis and Kafka (the trace context travels in the
+  outbox and in record headers).
+- **Metrics:** RED metrics per route, business counters (holds by result,
+  bookings, payments by outcome, refunds), outbox backlog, consumer and
+  dead-letter counts, Postgres pool, Redis and Go runtime. Latency panels
+  carry exemplars: click a dot to open that request's trace.
+- **Logs:** JSON on stdout and OTLP to Loki, with `trace_id` on every line.
+- **Dashboard:** Grafana → Dashboards → Ticketing → *Service overview* (pick a
+  service at the top).
+- **Alerts** ([alerts.yml](deploy/compose/observability/alerts.yml)): 5xx rate,
+  p95 latency, outbox backlog, dead-lettered messages, payment provider errors.
 
-Every route needs a customer token, except availability.
-
-| Method | Path | Description |
-|---|---|---|
-| `GET` | `/v1/events/{id}/availability` | Booked and currently held seats of an event |
-| `POST` | `/v1/holds` | Hold seats for `HOLD_TTL` (all or nothing); 409 lists taken seats |
-| `GET` | `/v1/holds/{id}` | Get a hold |
-| `DELETE` | `/v1/holds/{id}` | Release a hold early |
-| `POST` | `/v1/bookings` | Turn a hold into a booking; idempotent per hold (201 new, 200 retry) |
-| `GET` | `/v1/bookings/{id}` | Get a booking |
-| `POST` | `/v1/bookings/{id}/cancel` | Cancel an unpaid booking and free its seats |
-
-```bash
-curl -i localhost:8000/v1/holds -H "Authorization: Bearer $TOKEN"   -d '{"event_id": "<event id>", "seat_ids": ["<seat id>", "<seat id>"]}'
-curl -i localhost:8000/v1/bookings -H "Authorization: Bearer $TOKEN"   -d '{"hold_id": "<hold id>"}'
-```
-
-How double booking is prevented is explained in
-[ADR 5](docs/adr/0005-seat-holds-in-redis-bookings-in-postgres.md).
-
-## Payment saga
-
-A new booking is `pending_payment`. The booking service publishes
-`BookingCreated` (through its outbox); the payment service charges the
-customer and publishes `PaymentSucceeded` or `PaymentFailed`; the booking is
-then `confirmed` or `cancelled` (seats freed). Bookings unpaid after
-`PAYMENT_TIMEOUT` are cancelled, and a payment that arrives for a cancelled
-booking is refunded.
+## Testing
 
 ```bash
-curl -H "Authorization: Bearer $TOKEN" 'localhost:8000/v1/payments?booking_id=<booking id>'
+make test              # unit tests (race detector when a C compiler is available)
+make test-integration  # + adapter tests against real Postgres and Redis (testcontainers)
+make lint              # golangci-lint v2 with a strict configuration
+make vuln              # govulncheck
+make load-test         # k6 flash sale through the gateway + database check for double bookings
 ```
 
-To try the failure paths: prices ending in `.13` (e.g. `2513` cents) are
-declined by the mock provider; `PROVIDER_FAILURE_RATE` injects transient
-errors (retried); stop the payment container to see the timeout and the
-refund compensation. Details in [ADR 6](docs/adr/0006-payment-saga-with-outbox-and-kafka.md).
+What the tests prove, beyond the happy path:
 
-## Notifications
+- 50 goroutines racing for overlapping seats in Redis: no seat has two owners.
+- 20 concurrent bookings of one seat in Postgres: exactly one succeeds.
+- Ten concurrent publishes of one event: the row lock lets one through.
+- A rolled-back transaction leaves no outbox event behind.
+- Redelivered messages charge once, confirm once, email once.
+- Forged, expired, foreign-key, wrong-audience and `alg: none` tokens are rejected.
 
-The notification service consumes booking and payment events and emails the
-customer when a booking is confirmed, cancelled (with the reason) or refunded.
-Every email lands in Mailpit (http://localhost:8025).
-
-Kafka delivers at least once, so the service uses the **inbox pattern**: the
-message id is inserted into an `inbox` table in the same transaction that
-wraps the send, and a message already in the inbox is skipped. Replaying a
-whole topic sends no duplicate emails.
+CI ([ci.yml](.github/workflows/ci.yml)) runs lint, unit and integration tests
+with `-race`, govulncheck, buf lint and breaking-change detection, compose,
+alert-rule and dashboard validation, and builds every image.
 
 ## Repository layout
 
 ```
-services/<name>/        one directory per service (cmd/, internal/, migrations/, Dockerfile)
-pkg/                    shared infrastructure: httpx, grpcx, telemetry, logger, postgres, redisx
-api/proto/              protobuf contracts (buf); generated code in api/gen
-deploy/compose/         docker compose files for infrastructure, observability and services
-docs/adr/               architecture decision records
+api/proto/            protobuf contracts: gRPC catalog API and Kafka event schemas (buf)
+api/gen/              generated Go code (committed)
+services/<name>/      one service: cmd/ (main), internal/{domain,app,adapter,transport,config}
+pkg/                  shared infrastructure: httpx, grpcx, kafkax, outbox, messaging,
+                      telemetry, logger, postgres, redisx, bootstrap
+deploy/compose/       infrastructure, observability and services; gateway and Grafana config
+scripts/              demo.sh, k6 load test
+docs/                 ADRs, load test report
 ```
 
-## Roadmap
+Inside a service, dependencies point inwards: `domain` has no infrastructure
+imports, `app` defines the interfaces it needs (ports) and `adapter` implements
+them; `transport` translates HTTP, gRPC and Kafka into use cases.
 
-- [x] Phase 1 — repository skeleton, tooling, CI, infrastructure
-- [x] Phase 2 — `event` service end to end
-- [x] Phase 3 — observability stack (OpenTelemetry, Prometheus, Tempo, Loki, Grafana)
-- [x] Phase 4 — `booking` service, gRPC, seat holds in Redis
-- [x] Phase 5 — Kafka, transactional outbox, `payment` service, saga
-- [x] Phase 6 — `notification` service
-- [x] Phase 7 — Traefik gateway and JWT authentication
-- [ ] Phase 8 — dashboards, load tests, hardening
+## What I would do next
+
+- Kubernetes manifests (Helm or Kustomize) with network policies instead of
+  "no host ports", and horizontal autoscaling of booking and event.
+- Tail sampling in the collector, and moving the observability stack off the
+  application hosts (see the [load test analysis](docs/load-test.md)).
+- A real identity provider (OIDC) instead of the configuration-backed users,
+  and refresh tokens.
+- An orchestrated saga (state machine) if the booking flow gains more steps.

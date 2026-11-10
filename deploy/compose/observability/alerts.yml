@@ -1,0 +1,66 @@
+# Prometheus alerting rules. Alerts are visible at http://localhost:9090/alerts;
+# in production an Alertmanager would route them to on-call.
+#
+# Each alert is about a symptom a user or operator would notice, not about an
+# internal detail, and says what to look at first.
+groups:
+  - name: ticketing-slo
+    rules:
+      - alert: HighServerErrorRate
+        expr: |
+          (
+            sum by (job) (rate(http_server_request_duration_seconds_count{http_response_status_code=~"5.."}[5m]))
+            /
+            sum by (job) (rate(http_server_request_duration_seconds_count[5m]))
+          ) > 0.05
+        for: 5m
+        labels:
+          severity: page
+        annotations:
+          summary: "{{ $labels.job }}: more than 5% of requests fail with 5xx"
+          description: "Check the service's logs in Grafana (Service overview → Logs) and open a failing trace from the latency panel."
+
+      - alert: HighLatency
+        expr: |
+          histogram_quantile(0.95,
+            sum by (job, le) (rate(http_server_request_duration_seconds_bucket[5m]))
+          ) > 1
+        for: 10m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "{{ $labels.job }}: p95 latency above 1s for 10 minutes"
+          description: "Click an exemplar on the p95 panel to see where the time goes (database, Redis, gRPC)."
+
+  - name: ticketing-messaging
+    rules:
+      - alert: OutboxBacklogGrowing
+        expr: max by (job) (ticketing_outbox_pending) > 100
+        for: 5m
+        labels:
+          severity: page
+        annotations:
+          summary: "{{ $labels.job }}: {{ $value }} outbox messages are not being published"
+          description: "Kafka or the outbox relay is down. Bookings still succeed, but payments and emails are delayed."
+
+      - alert: MessagesDeadLettered
+        expr: sum by (job, topic, group) (increase(ticketing_kafka_dead_lettered_total[10m])) > 0
+        labels:
+          severity: ticket
+        annotations:
+          summary: "{{ $labels.group }} moved messages from {{ $labels.topic }} to the dead-letter topic"
+          description: "Inspect {{ $labels.topic }}.dlq in the Redpanda console; the dlq_error header says why. Replay after fixing."
+
+      - alert: PaymentProviderErrors
+        expr: |
+          (
+            sum(rate(ticketing_payments_processed_total{outcome="error"}[5m]))
+            /
+            sum(rate(ticketing_payments_processed_total[5m]))
+          ) > 0.5
+        for: 5m
+        labels:
+          severity: page
+        annotations:
+          summary: "More than half of the payment attempts fail with transient provider errors"
+          description: "Payments are retried, but bookings may hit the payment timeout and be cancelled."

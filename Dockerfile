@@ -1,9 +1,7 @@
-# syntax=docker/dockerfile:1
-
 # One Dockerfile builds every service: docker build --build-arg SERVICE=event .
 # The final image contains a single static binary on distroless, running as non-root.
 
-ARG GO_VERSION=1.25
+ARG GO_VERSION=1.26
 
 FROM golang:${GO_VERSION}-alpine AS build
 ARG GOPROXY=https://proxy.golang.org,direct

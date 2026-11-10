@@ -22,7 +22,7 @@ jobs:
           go-version-file: go.mod
       - uses: golangci/golangci-lint-action@v8
         with:
-          version: v2.4.0
+          version: v2.15.0
           args: --build-tags integration
 
   test:
@@ -76,6 +76,9 @@ jobs:
             -f deploy/compose/docker-compose.infra.yml \
             -f deploy/compose/docker-compose.observability.yml \
             -f deploy/compose/docker-compose.services.yml config --quiet
+      - name: Validate Prometheus alert rules
+        run: |
+          docker run --rm --entrypoint promtool             -v "$PWD/deploy/compose/observability:/cfg" prom/prometheus:v3.5.0             check rules /cfg/alerts.yml
       - name: Validate Grafana dashboards
         run: for f in deploy/compose/observability/grafana/dashboards/*.json; do jq empty "$f"; done
       - name: Build service images

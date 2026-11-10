@@ -22,7 +22,6 @@ import (
 	"go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetricgrpc"
 	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc"
 	"go.opentelemetry.io/otel/log"
-	"go.opentelemetry.io/otel/log/global"
 	lognoop "go.opentelemetry.io/otel/log/noop"
 	"go.opentelemetry.io/otel/propagation"
 	sdklog "go.opentelemetry.io/otel/sdk/log"
@@ -105,7 +104,7 @@ func Setup(ctx context.Context, cfg Config) (_ *Telemetry, err error) {
 		sdklog.WithProcessor(sdklog.NewBatchProcessor(logExp)),
 	)
 	t.shutdowns = append(t.shutdowns, lp.Shutdown)
-	global.SetLoggerProvider(lp)
+	otel.SetLoggerProvider(lp)
 	t.LoggerProvider = lp
 
 	// Go runtime metrics: memory, GC, goroutines, scheduler latency.

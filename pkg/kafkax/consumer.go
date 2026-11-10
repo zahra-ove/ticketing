@@ -10,7 +10,10 @@ import (
 
 	"github.com/twmb/franz-go/pkg/kgo"
 	"github.com/twmb/franz-go/plugin/kotel"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/metric"
 	"go.opentelemetry.io/otel/trace"
 
 	"github.com/zahra-ove/ticketing/pkg/messaging"
@@ -65,6 +68,9 @@ type Consumer struct {
 	handler Handler
 	log     *slog.Logger
 	cfg     ConsumerConfig
+
+	processed    metric.Int64Counter
+	deadLettered metric.Int64Counter
 }
 
 // NewConsumer joins the consumer group and returns a Consumer.
@@ -94,7 +100,23 @@ func NewConsumer(cfg ConsumerConfig, h Handler, log *slog.Logger) (*Consumer, er
 	if err != nil {
 		return nil, fmt.Errorf("create kafka consumer: %w", err)
 	}
-	return &Consumer{client: client, tracer: tracer, handler: h, log: log, cfg: cfg}, nil
+	meter := otel.Meter("github.com/zahra-ove/ticketing/pkg/kafkax")
+	processed, err := meter.Int64Counter("ticketing.kafka.processed",
+		metric.WithDescription("Records handled successfully, by topic and consumer group."), metric.WithUnit("{record}"))
+	if err != nil {
+		return nil, fmt.Errorf("create counter: %w", err)
+	}
+	deadLettered, err := meter.Int64Counter("ticketing.kafka.dead_lettered",
+		metric.WithDescription("Records moved to a dead-letter topic; every one needs a human look."), metric.WithUnit("{record}"))
+	if err != nil {
+		return nil, fmt.Errorf("create counter: %w", err)
+	}
+
+	return &Consumer{client: client, tracer: tracer, handler: h, log: log, cfg: cfg, processed: processed, deadLettered: deadLettered}, nil
+}
+
+func (c *Consumer) attrs(rec *kgo.Record) metric.MeasurementOption {
+	return metric.WithAttributes(attribute.String("topic", rec.Topic), attribute.String("group", c.cfg.Group))
 }
 
 // Run consumes until ctx is cancelled, then leaves the group cleanly.
@@ -156,6 +178,7 @@ func (c *Consumer) process(ctx context.Context, rec *kgo.Record) error {
 	var err error
 	for attempt := 1; attempt <= c.cfg.MaxAttempts; attempt++ {
 		if err = c.handler(pctx, rec); err == nil {
+			c.processed.Add(pctx, 1, c.attrs(rec))
 			return nil
 		}
 		if isPermanent(err) {
@@ -177,7 +200,11 @@ func (c *Consumer) process(ctx context.Context, rec *kgo.Record) error {
 	span.RecordError(err)
 	span.SetStatus(codes.Error, err.Error())
 	log.ErrorContext(pctx, "moving message to dead-letter topic", slog.Any("error", err))
-	return c.deadLetter(pctx, rec, err)
+	if dlqErr := c.deadLetter(pctx, rec, err); dlqErr != nil {
+		return dlqErr
+	}
+	c.deadLettered.Add(pctx, 1, c.attrs(rec))
+	return nil
 }
 
 func (c *Consumer) deadLetter(ctx context.Context, rec *kgo.Record, cause error) error {

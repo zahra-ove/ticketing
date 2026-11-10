@@ -24,13 +24,16 @@ PROTOC_GEN_GO_GRPC_VERSION := v1.5.1
 RACE ?= $(if $(shell command -v gcc 2>/dev/null),-race,)
 
 # Docker Desktop on Windows: the Ryuk reaper container of testcontainers fails to
-# start, and Docker 26 rejects the newer API version the client asks for.
+# start, Docker 26 rejects the newer API version the client asks for, and
+# resolving "localhost" can time out while many containers start at once.
 ifeq ($(OS),Windows_NT)
 export TESTCONTAINERS_RYUK_DISABLED ?= true
 export DOCKER_API_VERSION ?= 1.45
+# Under load, resolving "localhost" can time out on Windows; skip the lookup.
+export TESTCONTAINERS_HOST_OVERRIDE ?= 127.0.0.1
 endif
 
-GOLANGCI_LINT_VERSION := v2.4.0
+GOLANGCI_LINT_VERSION := v2.15.0
 GOVULNCHECK_VERSION   := v1.1.4
 
 ##@ General
@@ -61,7 +64,8 @@ test: ## Run unit tests (with -race when gcc is available)
 
 .PHONY: test-integration
 test-integration: ## Run integration tests (needs Docker; uses testcontainers)
-	go test $(RACE) -count=1 -tags integration ./...
+	@# -p 2: each package starts its own containers; more at once overwhelms Docker Desktop.
+	go test $(RACE) -count=1 -p 2 -tags integration ./...
 
 .PHONY: cover
 cover: ## Run tests and write coverage.html
@@ -153,6 +157,25 @@ services-down: ## Stop infrastructure and all services
 .PHONY: services-logs
 services-logs: ## Follow logs of all services
 	$(STACK) logs -f gateway auth event booking payment notification
+
+##@ Demo
+
+.PHONY: demo
+demo: ## Guided tour through the gateway: auth, holds, saga, failures (needs services-up)
+	bash scripts/demo.sh
+
+##@ Load test
+
+K6_IMAGE := grafana/k6:1.3.0
+VUS      ?= 50
+
+.PHONY: load-test
+load-test: ## Flash-sale load test through the gateway (needs services-up), then check for double bookings
+	MSYS_NO_PATHCONV=1 docker run --rm --network ticketing -v "$(CURDIR)/scripts/loadtest:/scripts:ro" \
+		-e BASE_URL=http://gateway:80 -e VUS=$(VUS) $(K6_IMAGE) run /scripts/flash-sale.js 2>&1 | tee loadtest.out
+	@sleep 30 # let the payment saga drain
+	@EVENT_ID=$$(grep -o 'EVENT_ID=[0-9a-f-]*' loadtest.out | head -1 | cut -d= -f2); \
+	MSYS_NO_PATHCONV=1 docker exec -i ticketing-postgres-1 psql -U booking -d booking -v event_id=$$EVENT_ID < scripts/loadtest/verify.sql
 
 .PHONY: compose-config
 compose-config: $(COMPOSE_DIR)/.env ## Validate the compose files

@@ -10,6 +10,9 @@ otlp:
     - service.version
     - deployment.environment.name
 
+rule_files:
+  - /etc/prometheus/alerts.yml
+
 storage:
   tsdb:
     # OTLP pushes can arrive slightly out of order.

@@ -4,7 +4,8 @@
 *.test
 *.out
 
-# Coverage
+# Coverage and load test output
+loadtest.out
 coverage.*
 
 # Local env files (keep the examples)
