@@ -1,0 +1,101 @@
+# Routes, authentication and rate limits of the gateway.
+#
+# Every router first removes the identity headers a client might send
+# (strip-identity), then asks the auth service to verify the bearer token
+# (authenticate). Only the auth service's answer can set X-Customer-ID and
+# X-User-Role on the request that reaches a service, so services can trust them.
+http:
+  routers:
+    auth:
+      rule: "Path(`/v1/token`) || Path(`/.well-known/jwks.json`)"
+      entryPoints: [web]
+      service: auth
+      middlewares: [strip-identity, login-ratelimit]
+      priority: 100
+
+    availability:
+      rule: "PathRegexp(`^/v1/events/[^/]+/availability$`)"
+      entryPoints: [web]
+      service: booking
+      middlewares: [strip-identity, authenticate]
+      priority: 90
+
+    events:
+      rule: "PathPrefix(`/v1/events`)"
+      entryPoints: [web]
+      service: event
+      middlewares: [strip-identity, authenticate]
+      priority: 10
+
+    holds:
+      rule: "PathPrefix(`/v1/holds`)"
+      entryPoints: [web]
+      service: booking
+      middlewares: [strip-identity, authenticate, holds-ratelimit]
+      priority: 10
+
+    bookings:
+      rule: "PathPrefix(`/v1/bookings`)"
+      entryPoints: [web]
+      service: booking
+      middlewares: [strip-identity, authenticate]
+      priority: 10
+
+    payments:
+      rule: "PathPrefix(`/v1/payments`)"
+      entryPoints: [web]
+      service: payment
+      middlewares: [strip-identity, authenticate]
+      priority: 10
+
+  middlewares:
+    # An empty value deletes the header: clients cannot impersonate anyone.
+    strip-identity:
+      headers:
+        customRequestHeaders:
+          X-Customer-ID: ""
+          X-User-Role: ""
+
+    # Calls the auth service before every request. 2xx: the listed response
+    # headers are copied onto the forwarded request. Anything else is returned
+    # to the client as is (401 for a bad or expired token).
+    authenticate:
+      forwardAuth:
+        address: http://auth:8080/v1/verify
+        authResponseHeaders:
+          - X-Customer-ID
+          - X-User-Role
+
+    # Seat holds are the hot, contended endpoint: limit each token.
+    holds-ratelimit:
+      rateLimit:
+        average: 10
+        burst: 20
+        period: 1s
+        sourceCriterion:
+          requestHeaderName: Authorization
+
+    # Slows down password guessing, per client IP.
+    login-ratelimit:
+      rateLimit:
+        average: 5
+        burst: 10
+        period: 1s
+
+  services:
+    auth:
+      loadBalancer:
+        servers: [{ url: "http://auth:8080" }]
+        healthCheck: { path: /readyz, interval: 10s }
+    event:
+      loadBalancer:
+        servers: [{ url: "http://event:8080" }]
+        healthCheck: { path: /readyz, interval: 10s }
+    booking:
+      loadBalancer:
+        servers: [{ url: "http://booking:8080" }]
+        healthCheck: { path: /readyz, interval: 10s }
+    payment:
+      loadBalancer:
+        servers: [{ url: "http://payment:8080" }]
+        healthCheck: { path: /readyz, interval: 10s }

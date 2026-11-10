@@ -74,6 +74,9 @@ func sampleEvent() *domain.Event {
 func do(t *testing.T, h http.Handler, method, path, body string) *httptest.ResponseRecorder {
 	t.Helper()
 	req := httptest.NewRequestWithContext(t.Context(), method, path, strings.NewReader(body))
+	// Requests come through the gateway as an admin unless a test says otherwise.
+	req.Header.Set(httpx.HeaderCustomerID, uuid.NewString())
+	req.Header.Set(httpx.HeaderUserRole, httpx.RoleAdmin)
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
 	return rec
@@ -326,5 +329,35 @@ func TestMethodNotAllowed(t *testing.T) {
 
 	if rec := do(t, h, http.MethodDelete, "/v1/events", ""); rec.Code != http.StatusMethodNotAllowed {
 		t.Errorf("status = %d, want 405", rec.Code)
+	}
+}
+
+func TestWritesRequireAdmin(t *testing.T) {
+	t.Parallel()
+	h := httpapi.NewHandler(stubService{
+		get: func(uuid.UUID) (*domain.Event, error) { return sampleEvent(), nil },
+	}, stubPinger{}, discard)
+
+	for _, tc := range []struct {
+		name, role, method, path string
+		want                     int
+	}{
+		{"customer cannot create", httpx.RoleCustomer, http.MethodPost, "/v1/events", http.StatusForbidden},
+		{"anonymous cannot publish", "", http.MethodPost, "/v1/events/" + uuid.NewString() + "/publish", http.StatusUnauthorized},
+		{"anonymous can read", "", http.MethodGet, "/v1/events/" + uuid.NewString(), http.StatusOK},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			req := httptest.NewRequestWithContext(t.Context(), tc.method, tc.path, strings.NewReader("{}"))
+			if tc.role != "" {
+				req.Header.Set(httpx.HeaderCustomerID, uuid.NewString())
+				req.Header.Set(httpx.HeaderUserRole, tc.role)
+			}
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, req)
+			if rec.Code != tc.want {
+				t.Errorf("status = %d, want %d", rec.Code, tc.want)
+			}
+		})
 	}
 }

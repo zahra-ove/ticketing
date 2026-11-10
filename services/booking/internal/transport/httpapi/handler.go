@@ -14,10 +14,6 @@ import (
 	"github.com/zahra-ove/ticketing/services/booking/internal/domain"
 )
 
-// CustomerIDHeader identifies the caller until authentication is added in
-// front of the service; the gateway will then set it from the verified token.
-const CustomerIDHeader = "X-Customer-ID"
-
 // BookingService is the subset of the application layer the API needs.
 type BookingService interface {
 	HoldSeats(ctx context.Context, customerID, eventID uuid.UUID, seatIDs []uuid.UUID) (*domain.Hold, error)
@@ -58,14 +54,16 @@ func NewHandler(svc BookingService, deps map[string]httpx.Pinger, log *slog.Logg
 
 type customerHandler func(w http.ResponseWriter, r *http.Request, customerID uuid.UUID)
 
+// withCustomer requires an authenticated caller. The caller's id comes from
+// the identity headers that the gateway sets from a verified token.
 func (h *handler) withCustomer(next customerHandler) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		id, err := uuid.Parse(r.Header.Get(CustomerIDHeader))
-		if err != nil {
-			httpx.WriteProblem(w, r, httpx.Problem{Status: http.StatusUnauthorized, Detail: CustomerIDHeader + " header with a valid UUID is required"})
+		c, ok := httpx.CallerFrom(r)
+		if !ok {
+			httpx.WriteProblem(w, r, httpx.Problem{Status: http.StatusUnauthorized, Detail: "a valid bearer token is required"})
 			return
 		}
-		next(w, r, id)
+		next(w, r, c.ID)
 	}
 }
 

@@ -62,7 +62,8 @@ func do(t *testing.T, h http.Handler, method, path, body string, customer uuid.U
 	t.Helper()
 	req := httptest.NewRequestWithContext(t.Context(), method, path, strings.NewReader(body))
 	if customer != uuid.Nil {
-		req.Header.Set(httpapi.CustomerIDHeader, customer.String())
+		req.Header.Set(httpx.HeaderCustomerID, customer.String())
+		req.Header.Set(httpx.HeaderUserRole, httpx.RoleCustomer)
 	}
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)

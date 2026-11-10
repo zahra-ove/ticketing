@@ -39,12 +39,13 @@ func NewHandler(svc EventService, db httpx.Pinger, log *slog.Logger) http.Handle
 	mux.HandleFunc("GET /livez", httpx.Livez)
 	mux.HandleFunc("GET /readyz", httpx.Readyz(log, map[string]httpx.Pinger{"database": db}))
 
-	httpx.Route(mux, "POST /v1/events", h.createEvent)
+	// Reading the catalog is public; changing it is for admins only.
 	httpx.Route(mux, "GET /v1/events", h.listEvents)
 	httpx.Route(mux, "GET /v1/events/{id}", h.getEvent)
-	httpx.Route(mux, "POST /v1/events/{id}/publish", h.publishEvent)
-	httpx.Route(mux, "POST /v1/events/{id}/cancel", h.cancelEvent)
 	httpx.Route(mux, "GET /v1/events/{id}/seats", h.listSeats)
+	httpx.Route(mux, "POST /v1/events", httpx.RequireRole(h.createEvent, httpx.RoleAdmin))
+	httpx.Route(mux, "POST /v1/events/{id}/publish", httpx.RequireRole(h.publishEvent, httpx.RoleAdmin))
+	httpx.Route(mux, "POST /v1/events/{id}/cancel", httpx.RequireRole(h.cancelEvent, httpx.RoleAdmin))
 
 	return httpx.Middleware(mux, log)
 }

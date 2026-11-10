@@ -152,7 +152,7 @@ services-down: ## Stop infrastructure and all services
 
 .PHONY: services-logs
 services-logs: ## Follow logs of all services
-	$(STACK) logs -f event booking payment notification
+	$(STACK) logs -f gateway auth event booking payment notification
 
 .PHONY: compose-config
 compose-config: $(COMPOSE_DIR)/.env ## Validate the compose files

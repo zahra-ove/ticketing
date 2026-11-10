@@ -5,7 +5,7 @@ portfolio project that focuses on the hard parts of distributed systems:
 concurrent seat reservations, distributed transactions (saga), reliable
 messaging (transactional outbox), idempotency and end-to-end observability.
 
-> Status: work in progress. Phases 1–6 are done: infrastructure, observability, the `event`, `booking`, `payment` and `notification` services, and the payment saga over Kafka.
+> Status: work in progress. Phases 1–7 are done: services, payment saga over Kafka, notifications, observability, and a gateway with JWT authentication.
 
 ## Architecture
 
@@ -44,6 +44,8 @@ make check      # lint, tests with -race, govulncheck
 
 | Tool | URL |
 |---|---|
+| **API gateway** (all API calls) | http://localhost:8000 |
+| Traefik dashboard | http://localhost:8090 |
 | Grafana (dashboards, traces, logs) | http://localhost:3000 |
 | Prometheus | http://localhost:9090 |
 | Redpanda Console (topics, messages) | http://localhost:8085 |
@@ -97,6 +99,26 @@ service ──OTLP──▶ OpenTelemetry Collector ──▶ Tempo       (trace
 
 See [ADR 4](docs/adr/0004-observability-with-opentelemetry.md) for the reasoning.
 
+## Authentication
+
+All API calls go through the gateway on `:8000`; services have no public
+ports. Get a token, then send it as a bearer token:
+
+```bash
+TOKEN=$(curl -s localhost:8000/v1/token -d '{"username":"admin","password":"admin-secret"}' | jq -r .access_token)
+curl -H "Authorization: Bearer $TOKEN" localhost:8000/v1/events -d '{...}'
+```
+
+| User | Password | Role |
+|---|---|---|
+| `admin` | `admin-secret` | admin: manages the catalog, reads all payments |
+| `alice`, `bob` | `demo-secret` | customer |
+| `customer-<anything>` | `demo-secret` | customer (only with `DEMO_SIGNUP=true`, for load tests) |
+
+Reading the catalog needs no token. The gateway strips identity headers sent
+by clients and sets them only from a verified token; see
+[ADR 7](docs/adr/0007-gateway-and-authentication.md).
+
 ## Event service API
 
 | Method | Path | Description |
@@ -113,7 +135,7 @@ Errors use [RFC 9457 problem details](https://www.rfc-editor.org/rfc/rfc9457)
 (`application/problem+json`) and carry the `X-Request-ID` of the request.
 
 ```bash
-curl -i localhost:8081/v1/events -d '{
+curl -i localhost:8000/v1/events -H "Authorization: Bearer $ADMIN_TOKEN" -d '{
   "title": "GopherCon Tehran",
   "venue": "Milad Tower",
   "starts_at": "2027-03-01T17:00:00Z",
@@ -126,8 +148,7 @@ curl -i localhost:8081/v1/events -d '{
 
 ## Booking service API
 
-Customers are identified by the `X-Customer-ID` header (a UUID) until the
-gateway with JWT authentication is added in phase 7.
+Every route needs a customer token, except availability.
 
 | Method | Path | Description |
 |---|---|---|
@@ -140,8 +161,8 @@ gateway with JWT authentication is added in phase 7.
 | `POST` | `/v1/bookings/{id}/cancel` | Cancel an unpaid booking and free its seats |
 
 ```bash
-curl -i localhost:8082/v1/holds -H 'X-Customer-ID: 11111111-1111-4111-8111-111111111111'   -d '{"event_id": "<event id>", "seat_ids": ["<seat id>", "<seat id>"]}'
-curl -i localhost:8082/v1/bookings -H 'X-Customer-ID: 11111111-1111-4111-8111-111111111111'   -d '{"hold_id": "<hold id>"}'
+curl -i localhost:8000/v1/holds -H "Authorization: Bearer $TOKEN"   -d '{"event_id": "<event id>", "seat_ids": ["<seat id>", "<seat id>"]}'
+curl -i localhost:8000/v1/bookings -H "Authorization: Bearer $TOKEN"   -d '{"hold_id": "<hold id>"}'
 ```
 
 How double booking is prevented is explained in
@@ -157,7 +178,7 @@ then `confirmed` or `cancelled` (seats freed). Bookings unpaid after
 booking is refunded.
 
 ```bash
-curl localhost:8083/v1/payments?booking_id=<booking id>   # payment status
+curl -H "Authorization: Bearer $TOKEN" 'localhost:8000/v1/payments?booking_id=<booking id>'
 ```
 
 To try the failure paths: prices ending in `.13` (e.g. `2513` cents) are
@@ -194,5 +215,5 @@ docs/adr/               architecture decision records
 - [x] Phase 4 — `booking` service, gRPC, seat holds in Redis
 - [x] Phase 5 — Kafka, transactional outbox, `payment` service, saga
 - [x] Phase 6 — `notification` service
-- [ ] Phase 7 — Traefik gateway and JWT authentication
+- [x] Phase 7 — Traefik gateway and JWT authentication
 - [ ] Phase 8 — dashboards, load tests, hardening

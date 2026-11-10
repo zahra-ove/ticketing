@@ -36,13 +36,18 @@ func NewHandler(svc Service, deps map[string]httpx.Pinger, log *slog.Logger) htt
 	mux.HandleFunc("GET /livez", httpx.Livez)
 	mux.HandleFunc("GET /readyz", httpx.Readyz(log, deps))
 
-	httpx.Route(mux, "GET /v1/payments", func(w http.ResponseWriter, r *http.Request) {
+	httpx.Route(mux, "GET /v1/payments", httpx.RequireRole(func(w http.ResponseWriter, r *http.Request) {
+		caller, _ := httpx.CallerFrom(r)
 		bookingID, err := uuid.Parse(r.URL.Query().Get("booking_id"))
 		if err != nil {
 			httpx.WriteProblem(w, r, httpx.Problem{Status: http.StatusBadRequest, Detail: "booking_id query parameter must be a valid UUID"})
 			return
 		}
 		p, err := svc.GetByBookingID(r.Context(), bookingID)
+		// Customers see only their own payments; someone else's looks like a missing one.
+		if err == nil && !caller.IsAdmin() && p.CustomerID != caller.ID {
+			err = domain.ErrPaymentNotFound
+		}
 		switch {
 		case errors.Is(err, domain.ErrPaymentNotFound):
 			httpx.WriteProblem(w, r, httpx.Problem{Status: http.StatusNotFound, Detail: "no payment for this booking yet"})
@@ -56,7 +61,7 @@ func NewHandler(svc Service, deps map[string]httpx.Pinger, log *slog.Logger) htt
 			ID: p.ID, BookingID: p.BookingID, AmountCents: p.AmountCents, Status: string(p.Status),
 			FailureReason: p.FailureReason, CreatedAt: p.CreatedAt, UpdatedAt: p.UpdatedAt,
 		})
-	})
+	}, httpx.RoleCustomer, httpx.RoleAdmin))
 
 	return httpx.Middleware(mux, log)
 }

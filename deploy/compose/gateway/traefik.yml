@@ -1,0 +1,44 @@
+# Traefik static configuration: the single public entry point of the platform.
+entryPoints:
+  web:
+    address: ":80"
+  traefik:
+    address: ":8080" # dashboard and /ping, local only
+
+api:
+  dashboard: true
+  insecure: true # dashboard on :8080 without auth: local development only
+
+ping:
+  entryPoint: traefik
+
+providers:
+  # Routes are declared in a reviewed file instead of container labels.
+  file:
+    filename: /etc/traefik/dynamic.yml
+    watch: true
+
+log:
+  level: INFO
+  format: json
+
+accessLog:
+  format: json
+
+# The gateway reports to the same OpenTelemetry Collector as the services, so
+# each trace starts at the edge and the RED metrics include the gateway.
+tracing:
+  serviceName: gateway
+  otlp:
+    grpc:
+      endpoint: otel-collector:4317
+      insecure: true
+
+metrics:
+  otlp:
+    addEntryPointsLabels: true
+    addRoutersLabels: true
+    addServicesLabels: true
+    grpc:
+      endpoint: otel-collector:4317
+      insecure: true
